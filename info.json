@@ -1,0 +1,11 @@
+{
+  "name": "resource-balance",
+  "version": "1.4.0",
+  "title": "Resource Balance",
+  "author": "funtik13",
+  "factorio_version": "2.1",
+  "description": "A floating panel that shows produced, consumed and balance per minute for the items and fluids you pick — per planet or summed over all planets and platforms. Includes a deficit finder, search and sorting, trend charts, a large chart window with smooth lines, comparison of up to 4 resources and a per-recipe breakdown of producers and consumers. Made for overhaul mods like Pyanodon's.",
+  "dependencies": [
+    "base >= 2.0.0"
+  ]
+}

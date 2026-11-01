@@ -1,0 +1,75 @@
+---------------------------------------------------------------------------------------------------
+Version: 1.4.0
+Date: 2026-11-01
+  Info:
+    - Factorio 2.1 only from this version on (the last version for Factorio 2.0 is 1.3.0).
+  Features:
+    - Watcher: a bell button on every row of "My list" sets thresholds for the resource — minimum output and/or
+      minimum balance per minute, checked against the average over 1, 5, 10 or 30 minutes (production waves from
+      trains and buffers don't trigger it). Catches a stopped line whose balance is 0 − 0 = 0.
+    - A broken threshold turns the bell red and shows a counter on the mod button with the list of resources;
+      you are notified once and again only after the resource recovers.
+    - Mod settings (per player): "Watcher: chat message" and "Watcher: sound" (both off by default).
+    - "Watcher: on / paused" button in the panel and "Snooze for 30 m" per resource — e.g. while you rebuild.
+    - New "Stock" column: how long the stock in logistic networks lasts at the current deficit
+      ("0" when there is none, "<1m", "≈15m", "≈3.5h"; red under 10 minutes, yellow under an hour).
+    - Chart window: "What changed" table under the chart — the previous period against the last one
+      (produced, consumed, balance and the change), plus a one-line verdict: whether production or
+      consumption moved the balance, or that a line stopped completely.
+    - Producers & consumers tab: machine status counters for every recipe — missing ingredients, output full,
+      no power or fuel, other (a snapshot of the last scan, every 30 s, so the numbers don't flicker).
+    - Click a status counter to jump to the next such machine on the map: remote view next to the window
+      (not under it), the machine is circled in the colour of its status. Further clicks cycle through the machines.
+  Changes:
+    - The period-average line under the chart is replaced by the "What changed" table.
+    - The chart background between stacked resources is filled (no dark blotches in Factorio 2.1).
+    - The mod's internal chart surface is hidden from the remote view surface list.
+---------------------------------------------------------------------------------------------------
+Version: 1.3.0
+Date: 2026-10-26
+  Features:
+    - New "Planets" column: an "All planets" (Σ) row shows the planets where the resource is produced or
+      consumed in the chosen period (producers first, up to 8 icons, then "+N"; platforms as one icon).
+    - Mod setting (per player): "Number format" — Auto (k from 10,000), Short (k from 1000) or Full (1 000).
+  Changes:
+    - Inventory-like table: every cell is a dark tile, no grid lines.
+    - Resource icon and name share one cell; the planet column at the start is gone.
+    - Hovering anywhere from the resource name to the trend chart shows the per-planet breakdown.
+    - Long resource and recipe names are shortened with "…"; the full name is in the tooltip.
+---------------------------------------------------------------------------------------------------
+Version: 1.2.0
+Date: 2026-10-26
+  Features:
+    - Mod settings (per player): "Panel refresh" — Auto (by period), every second, every 5 s or every 10 s.
+    - Mod settings (per player): "Close the panel with Esc" (off by default).
+    - The chart window closes with Esc (or when another game window opens).
+  Changes:
+    - The per-planet breakdown of an "All planets" (Σ) row is also shown when hovering the resource name or icon.
+---------------------------------------------------------------------------------------------------
+Version: 1.1.0
+Date: 2026-10-26
+  Features:
+    - "All planets" (Σ) entries: totals over every planet and space platform, with a per-surface
+      breakdown in the tooltip (platforms grouped into one line). Choose "This planet" or "All planets"
+      next to the add button; works in the large chart and the producers & consumers tab too.
+  Changes:
+    - The add button now shows a "+" and is labelled more clearly.
+    - The resource table stretches to the full window width.
+---------------------------------------------------------------------------------------------------
+Version: 1.0.0
+Date: 2026-10-25
+  Features:
+    - Floating "Resource balance" panel: produced, consumed and balance per minute for chosen items and fluids.
+    - Every row is bound to its own planet (with planet icon), so cross-planet dependencies stay visible.
+    - Time periods like the vanilla statistics: 5s, 1m, 10m, 1h, 10h, 50h, 250h, 1000h.
+    - "Negative only" mode: every item and fluid with a deficit on the current planet, largest first.
+    - Search by translated or internal name, sorting by name, produced, consumed or balance.
+    - Mini trend chart in every row.
+    - Large chart window: thin production and consumption lines, balance band, grid and axis labels,
+      hover tooltips with values at any moment, smoothing (Auto, None, Light, Strong).
+    - Compare up to 4 resources on one chart with a shared time cursor (Ctrl+click or right-click a row).
+    - "Producers & consumers" tab: which recipes make and use a resource, machine counts and shares,
+      estimated instantly from game statistics or measured live from machines; buildings grouped separately.
+    - Open with Ctrl+Shift+R, the shortcut bar button or the top-left button.
+  Locale:
+    - English, Ukrainian, Russian.
