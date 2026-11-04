@@ -1,4 +1,24 @@
 ---------------------------------------------------------------------------------------------------
+Version: 1.5.0
+Date: 2026-11-04
+  Features:
+    - Several lists: tabs above "My list" (up to 12) — e.g. one per planet or per production chain. New, rename
+      and delete buttons; a tab shows the number of resources and a red status icon when its watcher fires.
+    - Export / import a list as a text string — share it with friends or move it to another save
+      (unknown resources from other mod sets are skipped, duplicates are not added twice).
+    - The watcher pause is per list now: pause one tab while you rebuild, the others keep watching.
+    - Producers & consumers tab: "Possible cause" hint for a resource in deficit — the ingredients of its main
+      producers that are short on the same planet too. Click one to open its producers & consumers and follow
+      the chain further.
+    - Producers & consumers tab: "Check delivery" hint — when the resource is short but a noticeable part of its
+      producers stand with a full output, the problem is in taking the product away (or a clogged byproduct),
+      not in production.
+    - Chart marks: note an event ("added a second iron line") at the current moment; it is shown on the chart
+      of every resource as a dashed blue line with the text in the tooltip. Up to 50 marks.
+  Changes:
+    - Existing lists and the watcher pause move to the first tab ("Main") automatically.
+    - Code split into modules (scripts/), no change in behaviour.
+---------------------------------------------------------------------------------------------------
 Version: 1.4.0
 Date: 2026-11-01
   Info:

@@ -1,10 +1,10 @@
 {
   "name": "resource-balance",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "title": "Resource Balance",
   "author": "funtik13",
   "factorio_version": "2.1",
-  "description": "A floating panel that shows produced, consumed and balance per minute for the items and fluids you pick — per planet or summed over all planets and platforms. A watcher alerts you when a line stops or runs short, a stock column shows how long logistic networks last, \"what changed\" explains a drop, and the per-recipe breakdown shows idle machines and jumps to them. Trend charts, a large chart and comparison of up to 4 resources. Made for overhaul mods like Pyanodon's.",
+  "description": "A floating panel that shows produced, consumed and balance per minute for the items and fluids you pick — per planet or summed over all planets and platforms. Several lists with export / import. A watcher alerts you when a line stops or runs short, a stock column shows how long logistic networks last, \"what changed\" explains a drop, and the per-recipe breakdown shows idle machines, jumps to them and hints at the cause of a deficit. Trend charts, a large chart with event marks and comparison of up to 4 resources. Made for overhaul mods like Pyanodon's.",
   "dependencies": [
     "base >= 2.0.0"
   ]

@@ -12,14 +12,16 @@ where a deficit deep in a long production chain is hard to spot.
 
 - **My list** of resources, each bound to its planet or summed over all planets (Σ), with trend charts,
   search and sorting; **Negative only** mode lists every deficit on the current planet.
+- **Several lists** as tabs, with **export / import** as a text string.
 - **Stock** column: how long the stock in logistic networks lasts at the current deficit.
-- **Large chart** with smooth lines, a balance band, values on hover and comparison of up to 4 resources.
+- **Large chart** with smooth lines, a balance band, values on hover, event **marks** and comparison of up to 4 resources.
 - **What changed**: the previous period against the last one, with a verdict — did production fall or
   consumption rise, or did the line stop completely.
 - **Producers & consumers** per recipe, with machine status counters (missing ingredients, output full,
-  no power or fuel); click a counter to jump to the next such machine on the map.
+  no power or fuel); click a counter to jump to the next such machine on the map. For a deficit it hints at
+  the cause: ingredients that are short too, or producers standing with a full output (a delivery problem).
 - **Watcher**: thresholds for minimum output and minimum balance, averaged over 1–30 minutes; a red bell and
-  a counter on the mod button, optional chat message and sound, pause and snooze.
+  a counter on the mod button, optional chat message and sound, pause per list and snooze.
 
 ![What changed](docs/2-what-changed.png)
 ![Producers & consumers](docs/3-producers-consumers.png)
