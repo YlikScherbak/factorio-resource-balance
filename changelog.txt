@@ -1,4 +1,50 @@
 ---------------------------------------------------------------------------------------------------
+Version: 1.6.0
+Date: 2026-11-05
+  Features:
+    - Machine state history: a background record of what every machine with a recipe was doing over the last
+      30 minutes (map setting "Machine state history": every 5 / 10 / 30 s or off; the load is spread evenly over
+      ticks). Producers & consumers shows "Producers over 10 min: working 54% · no input 31% · output full 12%",
+      and the machine count of every recipe has the same breakdown in its tooltip.
+    - "Idle" window: the recipes on the planet that stand still the most (lost machine time), the main reason and
+      whether it hurts — the product's balance is red when it is short, grey when the machine just waits for demand.
+    - Output target per resource (in the watcher dialog, now "Watcher and target"): "Produced" turns yellow below
+      95% of the target; Producers & consumers gives a verdict — target reached (with capacity reserve), not enough
+      machine capacity (with an estimate of how many machines to add), or enough capacity but machines lack input,
+      have a full output or lack power.
+    - "Dig deeper": a tree of possible root causes — follows short ingredients down the chain (up to 5 levels) and
+      says at every branch end why it ends there: machines are working at full capacity, machines are stopped
+      although ingredients are enough, no machines make it on the planet, storage is full.
+    - Producers & consumers names the byproduct that clogs the output (or ash in a burner) — "1 of 9 producers
+      are stopped: the output is clogged with X", whether X has no consumers, stopped consumers or working ones,
+      with "Who consumes it" and "Show a machine" buttons. The blue status counter lists what clogs the output.
+    - Full storage is recognised: when producers stand with a full output but consumers keep working (city blocks,
+      trains), it is shown as "storage is full — not a deficit" instead of false cause and delivery warnings.
+    - Fluid stock: the "Stock" column works for fluids too — fluid in storage tanks together with the pipes of
+      their segments.
+    - Watcher log ("Log" button): when each alert started and ended, how long it lasted, the lowest output and
+      balance, and how it ended. Click a resource to open its chart.
+    - Watcher marks on the chart: orange when a threshold breaks, green on recovery, grey when paused, snoozed or
+      changed — only on that resource's chart (mod setting "Watcher: marks on the chart", on by default).
+    - Alt+R adds what is under the cursor to the current list: an item, a fluid, a recipe's product, a machine's
+      product, a drill's ore or an offshore pump's fluid (rebindable).
+    - "Make a list from ingredients": a new list tab with the resource and the direct ingredients of the recipes
+      that currently make it on the planet, with a preview to untick extras.
+    - Icons in list tab names and chart marks (the icon selector button in the text field).
+    - Mod setting: machine rescan interval for Producers & consumers — 10 / 30 / 60 s.
+  Changes:
+    - List tabs scroll horizontally, the panel no longer grows wider with many lists.
+    - Esc closes the mod's dialogs one by one (watcher, marks, log, idle, lists…), then the chart window.
+    - Cause and delivery hints no longer flicker when the balance hovers around zero.
+    - Saving the watcher with unchanged thresholds keeps its state (no repeated alert).
+    - Fluid stock in large bases is recounted in small portions over several ticks — no hitch.
+  Bugfixes:
+    - With quality (Space Age) only normal quality was counted: production, consumption, stock and the
+      per-recipe breakdown now sum all qualities.
+    - Machines that put their product straight onto a belt (e.g. Pyanodon's foundries) were shown as "other"
+      instead of "output full"; frozen machines now count as "power or heat".
+    - Removing a resource during a watcher alert left its log record "ongoing" forever.
+---------------------------------------------------------------------------------------------------
 Version: 1.5.0
 Date: 2026-11-04
   Features:

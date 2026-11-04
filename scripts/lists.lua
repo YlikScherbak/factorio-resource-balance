@@ -45,11 +45,19 @@ end
 
 -- Рядок вкладок: кнопка на список (назва, кількість ресурсів, червона позначка — порушення сторожа),
 -- далі «новий», «перейменувати», «видалити», «експорт», «імпорт»
+local TABS_MAX_WIDTH = 900 -- ширше — вкладки прокручуються, панель не розтягується
+
 function M.add_tabs(parent, data)
   local row = parent.add{type = "flow", name = "resbal_lists", direction = "horizontal"}
   row.style.top_margin = 8
   row.style.vertical_align = "center"
   row.style.horizontal_spacing = 4
+  -- вкладки — у горизонтальній прокрутці; кнопки керування лишаються видимими праворуч
+  local scroll = row.add{type = "scroll-pane", name = "resbal_lists_scroll", style = "naked_scroll_pane",
+                         horizontal_scroll_policy = "auto", vertical_scroll_policy = "never"}
+  scroll.style.maximal_width = TABS_MAX_WIDTH
+  local tabs = scroll.add{type = "flow", direction = "horizontal"}
+  tabs.style.horizontal_spacing = 4
   for i, list in ipairs(data.lists) do
     local broken = violated_count(list)
     local caption = {"", M.caption(list), " (" .. #list.entries .. ")"}
@@ -57,9 +65,10 @@ function M.add_tabs(parent, data)
     if list.watch_paused then caption = {"", "[img=utility/pause] ", caption} end
     local tooltip = broken > 0 and {"resbal.list-tooltip-broken", broken} or {"resbal.list-tooltip"}
     if list.watch_paused then tooltip = {"", tooltip, "\n", {"resbal.list-tooltip-paused"}} end
-    local button = row.add{type = "button", name = "resbal_list_" .. i, caption = caption, tooltip = tooltip}
+    local button = tabs.add{type = "button", name = "resbal_list_" .. i, caption = caption, tooltip = tooltip}
     button.toggled = i == data.active
   end
+  if #data.lists > 1 then scroll.scroll_to_element(tabs["resbal_list_" .. data.active], "in-view") end
   local new = row.add{type = "sprite-button", name = "resbal_list_new", sprite = "utility/add", style = "tool_button",
                       tooltip = {"resbal.list-new"}}
   new.enabled = #data.lists < MAX_LISTS
@@ -85,16 +94,27 @@ local function close_dialog(player)
   if frame then frame.destroy() end
 end
 
--- Обрізає назву до NAME_MAX символів UTF-8 (не посеред літери) і прибирає пробіли по краях
+-- Обрізає текст до max знаків: літера UTF-8 — один знак (не ріжеться посередині), тег rich text
+-- ([item=…], [color=…], [/color]) — теж один знак, щоб не обрізати іконку на півслові
+function M.clip(text, max)
+  local out, count, i = {}, 0, 1
+  while i <= #text and count < max do
+    local token = text:match("^%[/?[%w%-_]+=?[^%[%]]*%]", i) or text:match("^[%z\1-\127\194-\244][\128-\191]*", i)
+    if token then
+      count = count + 1
+      out[count] = token
+      i = i + #token
+    else
+      i = i + 1 -- зламаний байт — пропускаємо
+    end
+  end
+  return table.concat(out)
+end
+
+-- Обрізає назву до NAME_MAX знаків і прибирає пробіли по краях
 local function clean_name(text)
   text = (text or ""):gsub("^%s+", ""):gsub("%s+$", "")
-  local out, count = {}, 0
-  for char in text:gmatch("[%z\1-\127\194-\244][\128-\191]*") do
-    count = count + 1
-    if count > NAME_MAX then break end
-    out[count] = char
-  end
-  local name = table.concat(out)
+  local name = M.clip(text, NAME_MAX)
   return name ~= "" and name or nil
 end
 
@@ -105,6 +125,7 @@ local function export_string(list)
     local item = {t = entry.type, n = entry.name, s = entry.surface}
     local watch = entry.watch
     if watch then item.w = {p = watch.min_produced, b = watch.min_balance, m = watch.window} end
+    item.g = entry.target -- ціль випуску (необов'язково)
     entries[#entries + 1] = item
   end
   return EXPORT_PREFIX .. helpers.encode_string(helpers.table_to_json({name = list.name, entries = entries}))
@@ -130,6 +151,8 @@ local function import_string(text)
     if proto and not seen[key] then
       seen[key] = true
       local entry = {type = item.t, name = item.n, surface = item.s}
+      local target = tonumber(item.g)
+      if target and target > 0 then entry.target = target end
       if type(item.w) == "table" then
         local produced, balance, window = tonumber(item.w.p), tonumber(item.w.b), tonumber(item.w.m)
         if produced or balance then
@@ -192,7 +215,7 @@ local function open_dialog(player, mode)
     row.style.vertical_align = "center"
     row.style.horizontal_spacing = 12
     row.add{type = "label", caption = {"resbal.list-name"}}
-    local field = row.add{type = "textfield", name = "resbal_list_name",
+    local field = row.add{type = "textfield", name = "resbal_list_name", icon_selector = true,
                           text = (mode == "rename" and list.name) or ""}
     field.style.width = 260
     field.focus()
@@ -283,6 +306,24 @@ end
 function M.on_confirmed(player, element)
   if element.name ~= "resbal_list_name" then return false end
   confirm(player)
+  return true
+end
+
+-- Чи можна додати ще одну вкладку
+function M.can_add(data)
+  return #data.lists < MAX_LISTS
+end
+
+-- Нова вкладка з готовими ресурсами (напр., «список з інгредієнтів»), робиться активною.
+-- Повертає false, якщо вкладок уже максимум.
+function M.add_list(player, name, entries)
+  local data = ctx.player_data(player)
+  if not M.can_add(data) then return false end
+  data.lists[#data.lists + 1] = {name = clean_name(name), entries = entries}
+  data.active = #data.lists
+  M.normalize(data)
+  ctx.build(player)
+  ctx.after_change(player)
   return true
 end
 

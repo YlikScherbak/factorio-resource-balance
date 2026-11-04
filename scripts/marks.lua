@@ -1,12 +1,28 @@
 -- Позначки на великому графіку: «додав другу лінію» тощо. Зберігається момент (тік), тож позначка
--- стоїть на своєму місці за будь-якого проміжку. Спільні для всіх ресурсів гравця.
---   data.marks = {{tick = число, text = рядок}, ...} (від старих до нових)
+-- стоїть на своєму місці за будь-якого проміжку. Ручні — спільні для всіх ресурсів гравця.
+-- Автопозначки сторожа (auto = вид) — лише на графіку свого ресурсу (resource).
+--   data.marks = {{tick = число, text = рядок або локалізований рядок, auto = nil | "alert" | "recover" |
+--                  "pause" | "snooze" | "changed", resource = {type, name, surface}?}, ...} (від старих до нових)
 local M = {}
 
-local MAX_MARKS = 50
+local MAX_MARKS = 50 -- ручних
+local AUTO_MAX = 30  -- автоматичних (окремий ліміт: сторож не витісняє ручні позначки)
 local TEXT_MAX = 60 -- символів
 
--- Залежності з control.lua: player_data(player), redraw(player), ago_caption(seconds)
+-- Колір лінії й тексту: ручні — блакитні, спрацювання сторожа — помаранчеві, відновлення — зелені, решта — сірі
+local COLORS = {manual = {0.4, 0.75, 1}, alert = {1, 0.6, 0.2}, recover = {0.45, 0.9, 0.45}, other = {0.7, 0.7, 0.7}}
+
+function M.color(auto)
+  return COLORS[auto or "manual"] or COLORS.other
+end
+
+-- Текст у кольорі позначки (rich text)
+function M.colored(auto, text)
+  local c = M.color(auto)
+  return {"", string.format("[color=%g,%g,%g]", c[1], c[2], c[3]), text, "[/color]"}
+end
+
+-- Залежності з control.lua: player_data(player), redraw(player), ago_caption(seconds), duration_caption(seconds)
 local ctx
 
 function M.init(context)
@@ -18,12 +34,40 @@ local function marks_of(data)
   return data.marks
 end
 
--- Позначки, що потрапляють у вікно графіка (range секунд назад): {{ago = секунд, text = рядок}}
-function M.visible(data, range)
+-- Лишає не більше max позначок свого виду (ручних або автоматичних), видаляючи найстаріші
+local function prune(list, auto, max)
+  local count = 0
+  for _, mark in ipairs(list) do
+    if (mark.auto ~= nil) == auto then count = count + 1 end
+  end
+  local i = 1
+  while count > max and i <= #list do
+    if (list[i].auto ~= nil) == auto then
+      table.remove(list, i)
+      count = count - 1
+    else
+      i = i + 1
+    end
+  end
+end
+
+local function same_resource(a, b)
+  return a.type == b.type and a.name == b.name and a.surface == b.surface
+end
+
+-- Позначки, що потрапляють у вікно графіка (range секунд назад): {{ago = секунд, text, auto}}.
+-- panels — ресурси на графіку: автопозначки показуються лише для них.
+function M.visible(data, range, panels)
   local list = {}
   for _, mark in ipairs(marks_of(data)) do
     local ago = (game.tick - mark.tick) / 60
-    if ago >= 0 and ago <= range then list[#list + 1] = {ago = ago, text = mark.text} end
+    local shown = not mark.resource
+    if not shown then
+      for _, panel in ipairs(panels or {}) do
+        if same_resource(mark.resource, panel) then shown = true end
+      end
+    end
+    if shown and ago >= 0 and ago <= range then list[#list + 1] = {ago = ago, text = mark.text, auto = mark.auto} end
   end
   return list
 end
@@ -32,15 +76,12 @@ function M.add_button(parent)
   parent.add{type = "button", name = "resbal_marks_open", caption = {"resbal.marks"}, tooltip = {"resbal.marks-tooltip"}}
 end
 
+-- Обрізка до TEXT_MAX знаків; тег іконки ([item=…]) — один знак і не ріжеться (lists.clip)
+local clip = require("scripts.lists").clip
+
 local function clean_text(text)
   text = (text or ""):gsub("^%s+", ""):gsub("%s+$", "")
-  local out, count = {}, 0
-  for char in text:gmatch("[%z\1-\127\194-\244][\128-\191]*") do
-    count = count + 1
-    if count > TEXT_MAX then break end
-    out[count] = char
-  end
-  return table.concat(out)
+  return clip(text, TEXT_MAX)
 end
 
 local function dialog(player)
@@ -68,8 +109,11 @@ local function fill_list(frame, data)
     local ago = tbl.add{type = "label", caption = ctx.ago_caption((game.tick - mark.tick) / 60)}
     ago.style.font_color = {0.7, 0.7, 0.7}
     ago.style.minimal_width = 90
-    local text = tbl.add{type = "label", caption = mark.text ~= "" and mark.text or "—"}
+    local caption = mark.text ~= "" and mark.text or "—"
+    if mark.auto then caption = M.colored(mark.auto, caption) end
+    local text = tbl.add{type = "label", caption = caption}
     text.style.maximal_width = 300
+    text.style.single_line = false -- довгий текст автопозначки сторожа переноситься, а не обрізається
     tbl.add{type = "sprite-button", sprite = "utility/close", style = "tool_button_red", tooltip = {"resbal.marks-delete"},
             tags = {resbal_mark_del = i}}
   end
@@ -94,11 +138,12 @@ local function open_dialog(player)
   local row = inner.add{type = "flow", direction = "horizontal"}
   row.style.vertical_align = "center"
   row.style.horizontal_spacing = 8
-  local field = row.add{type = "textfield", name = "resbal_mark_text", tooltip = {"resbal.marks-text-tooltip"}}
+  local field = row.add{type = "textfield", name = "resbal_mark_text", icon_selector = true,
+                        tooltip = {"resbal.marks-text-tooltip"}}
   field.style.width = 300
   field.focus()
   row.add{type = "button", name = "resbal_mark_add", caption = {"resbal.marks-add"}, tooltip = {"resbal.marks-add-tooltip"}}
-  local hint = inner.add{type = "label", caption = {"resbal.marks-hint", MAX_MARKS}}
+  local hint = inner.add{type = "label", caption = {"resbal.marks-hint", MAX_MARKS, AUTO_MAX}}
   hint.style.single_line = false
   hint.style.maximal_width = 420
   hint.style.font_color = {0.7, 0.7, 0.7}
@@ -119,7 +164,7 @@ local function add_mark(player)
   local data = ctx.player_data(player)
   local list = marks_of(data)
   list[#list + 1] = {tick = game.tick, text = clean_text(field.text)}
-  while #list > MAX_MARKS do table.remove(list, 1) end
+  prune(list, false, MAX_MARKS)
   field.text = ""
   fill_list(frame, data)
   ctx.redraw(player)
@@ -143,6 +188,29 @@ function M.on_click(player, element)
     ctx.redraw(player)
   end
   return true
+end
+
+-- Автопозначка сторожа (якщо гравець не вимкнув у налаштуваннях).
+-- kind: "alert" (info.reasons — що порушено) або "recover" / "pause" / "snooze" / "changed" (info.since — тік початку)
+function M.add_auto(player, entry, kind, info)
+  if not player.mod_settings["resbal-watch-marks"].value then return end
+  local icon = "[" .. entry.type .. "=" .. entry.name .. "]"
+  local text
+  if kind == "alert" then
+    text = {"resbal.mark-watch-alert", icon, info.reasons}
+  else
+    local since = info and info.since
+    local duration = since and ctx.duration_caption((game.tick - since) / 60) or "?"
+    text = {"resbal.mark-watch-" .. kind, icon, duration}
+  end
+  local data = ctx.player_data(player)
+  local list = marks_of(data)
+  list[#list + 1] = {tick = game.tick, text = text, auto = kind,
+                     resource = {type = entry.type, name = entry.name, surface = entry.surface}}
+  prune(list, true, AUTO_MAX)
+  local frame = dialog(player)
+  if frame then fill_list(frame, data) end
+  ctx.redraw(player)
 end
 
 -- Enter у полі — додати позначку

@@ -17,7 +17,7 @@ return function(ctx)
   local TRACK_WINDOW = 60      -- с, ковзне вікно «наживо»
   local TRACK_POLL = 60        -- тіків між опитуваннями «наживо»
   local STATS_REFRESH = 300    -- тіків між оновленнями в режимі статистики
-  local TRACK_RESCAN = 1800    -- тіків між перепошуком машин
+  local TRACK_RESCAN = 1800    -- тіків між перепошуком машин, якщо налаштування resbal-scan-interval недоступне
   local TRACK_REORDER = 10     -- опитувань «наживо» між пересортуваннями рядків
   local TOP_RECIPES = 15
 
@@ -32,22 +32,39 @@ return function(ctx)
   -- Колір кола-підсвітки машини на мапі — як у значка групи
   local STATUS_COLORS = {no_input = {1, 0.85, 0.1}, full_output = {0.3, 0.6, 1}, power = {1, 0.25, 0.2},
                          other = {0.75, 0.75, 0.75}}
-  local STATUS_GROUP = {}
-  do
-    local names = {
-      working = {"working", "normal"},
-      no_input = {"item_ingredient_shortage", "fluid_ingredient_shortage", "no_ingredients", "no_input_fluid",
-                  "low_input_fluid", "missing_required_fluid", "input_fluid_too_cold", "input_fluid_too_hot"},
-      full_output = {"full_output", "not_enough_space_in_output", "full_burnt_result_output"},
-      power = {"no_power", "low_power", "no_fuel", "not_plugged_in_electric_network",
-               "recharging_after_power_outage", "low_temperature"},
-    }
-    for group, list in pairs(names) do
-      for _, name in ipairs(list) do
-        local value = defines.entity_status[name]
-        if value then STATUS_GROUP[value] = group end
+  local machines = require("scripts.machines") -- фонова історія станів машин; та сама таблиця груп станів
+  local STATUS_GROUP = machines.STATUS_GROUP
+
+  -- Історія станів (фоновий облік): вікно за проміжком вкладки, хв (історія тримається 30 хв)
+  local HISTORY_MINUTES = {one_minute = 5, ten_minutes = 10, one_hour = 30, ten_hours = 30}
+  local HISTORY_ORDER = {"working", "no_input", "full_output", "power", "other"}
+
+  -- «працювали 54% · без входу 31% · …» (групи від 1%)
+  local function history_parts(shares)
+    local parts = {""}
+    for _, group in ipairs(HISTORY_ORDER) do
+      local share = shares[group]
+      if share and share >= 0.005 then
+        if #parts > 1 then parts[#parts + 1] = " · " end
+        parts[#parts + 1] = {"resbal.history-" .. group, string.format("%.0f", share * 100)}
       end
     end
+    return parts
+  end
+
+  -- Контекст історії для вкладки: сила, індекси поверхонь, вікно (хв), тік
+  local function history_context(player, panel, precision_name)
+    local surfaces = {}
+    for _, surface in ipairs(surfaces_of(panel.surface)) do surfaces[#surfaces + 1] = surface.index end
+    return {force = player.force.index, surfaces = surfaces, minutes = HISTORY_MINUTES[precision_name] or 10,
+            tick = game.tick}
+  end
+
+  -- Частки для набору рецептів: shares, covered (хв) або nil
+  local function history_of(hist, recipes)
+    if not (hist and machines.enabled()) then return nil end
+    local shares, _, covered = machines.shares(hist.force, hist.surfaces, recipes, hist.minutes, hist.tick)
+    return shares, covered
   end
 
   -- Пошук рецептів — вбудованим фільтром гри prototypes.get_recipe_filtered (has-ingredient/has-product):
@@ -222,7 +239,8 @@ return function(ctx)
   -- Для «Усіх планет» — по черзі всі поверхні; зведення окреме для кожної (tracker.by_surface)
   -- і спільне (tracker.recipes) для показу кількості машин.
   local function start_rescan(tracker, player)
-    tracker.next_rescan = game.tick + TRACK_RESCAN
+    local interval = tonumber(player.mod_settings["resbal-scan-interval"].value)
+    tracker.next_rescan = game.tick + (interval and interval * 60 or TRACK_RESCAN)
     local chunks, total = {}, 0
     for _, surface in ipairs(surfaces_of(tracker.panel.surface)) do
       local entities = surface.find_entities_filtered{type = CRAFTING_TYPES, force = player.force}
@@ -233,11 +251,65 @@ return function(ctx)
       tracker.recipes, tracker.by_surface = tracker.recipes or {}, tracker.by_surface or {}
       return
     end
-    tracker.scan = {chunks = chunks, chunk = 1, position = 1, done = 0, total = total, by_surface = {}, statuses = {}, idle = {}}
+    tracker.scan = {chunks = chunks, chunk = 1, position = 1, done = 0, total = total, by_surface = {}, statuses = {}, idle = {},
+                    blockers = {}}
   end
 
   local function new_aggregate()
     return {total = 0, working = 0, capacity = 0, working_capacity = 0, productivity = 0}
+  end
+
+  -- Що блокує вихід машини зі станом «вихід повний»: ключ «тип/назва» продукту рецепта або nil.
+  -- Евристика: найповніший вихід (рідина — частка місткості бокса, предмет — частка стака); рідина від 90%
+  -- має пріоритет. Для «повний вихід відпрацьованого палива» — те, що лежить у паливній камері (попіл тощо).
+  local BURNT_STATUS = defines.entity_status.full_burnt_result_output
+  local FLUID_FULL = 0.9
+
+  local function item_counts(inventory) -- {[назва] = к-сть} — усі якості разом
+    local counts = {}
+    for _, stack in pairs(inventory and inventory.get_contents() or {}) do
+      counts[stack.name] = (counts[stack.name] or 0) + stack.count
+    end
+    return counts
+  end
+
+  local function blocker_of(entity, info)
+    if BURNT_STATUS and entity.status == BURNT_STATUS then
+      for name in pairs(item_counts(entity.get_inventory(defines.inventory.burnt_result))) do
+        return "item/" .. name
+      end
+      return nil
+    end
+    local items = item_counts(entity.get_output_inventory())
+    local fluids = {} -- {[назва] = найбільша частка місткості серед вихідних боксів}
+    -- 2.1: LuaFluidBox прибрали — рідинні сховища читаються методами самої сутності
+    for i = 1, entity.fluids_count do
+      local fluid = entity.get_fluid(i)
+      if fluid then
+        local proto = entity.get_fluid_box_prototype(i)
+        if proto and proto.object_name ~= "LuaFluidBoxPrototype" then proto = proto[1] end
+        if not proto or proto.production_type == "output" then
+          local capacity = entity.get_fluid_capacity(i)
+          local share = capacity > 0 and fluid.amount / capacity or 0
+          if share > (fluids[fluid.name] or 0) then fluids[fluid.name] = share end
+        end
+      end
+    end
+    local best, best_share, best_fluid, best_fluid_share = nil, 0, nil, 0
+    for _, product in ipairs(info.products) do
+      local share = 0
+      if product.type == "fluid" then
+        share = fluids[product.name] or 0
+        if share > best_fluid_share then best_fluid, best_fluid_share = product.key, share end
+      else
+        local count = items[product.name] or 0
+        local proto = prototypes.item[product.name]
+        share = count > 0 and count / ((proto and proto.stack_size) or 1) or 0
+      end
+      if share > best_share then best, best_share = product.key, share end
+    end
+    if best_fluid and best_fluid_share >= FLUID_FULL then return best_fluid end
+    return best
   end
 
   -- Обробляє наступну порцію; повертає true, коли прохід завершено
@@ -250,6 +322,7 @@ return function(ctx)
     local relevant = recipes_for(tracker.panel)
     scan.statuses = scan.statuses or {} -- прохід, розпочатий до 1.4
     scan.idle = scan.idle or {}
+    scan.blockers = scan.blockers or {} -- прохід, розпочатий до 1.6
     local budget = SCAN_BATCH
     while budget > 0 and scan.chunk <= #scan.chunks do
       local chunk = scan.chunks[scan.chunk]
@@ -276,6 +349,17 @@ return function(ctx)
             if group == "working" then
               agg.working = agg.working + 1
               agg.working_capacity = agg.working_capacity + crafts
+            end
+            if group == "full_output" and relevant[recipe] then -- і виробники, і споживачі (підказка лічильника)
+              local key = blocker_of(entity, info)
+              if key then
+                local blockers = scan.blockers[recipe]
+                if not blockers then
+                  blockers = {}
+                  scan.blockers[recipe] = blockers
+                end
+                blockers[key] = (blockers[key] or 0) + 1
+              end
             end
             if relevant[recipe] then
               local counts = scan.statuses[recipe]
@@ -330,6 +414,7 @@ return function(ctx)
     for _, agg in pairs(merged) do agg.productivity = agg.total > 0 and agg.productivity / agg.total or 0 end
     tracker.recipes, tracker.by_surface = merged, scan.by_surface
     tracker.statuses, tracker.status_tick, tracker.idle = scan.statuses, game.tick, scan.idle
+    tracker.blockers = scan.blockers
     tracker.scan = nil
     return true
   end
@@ -392,7 +477,7 @@ return function(ctx)
     local item_stats = statistics(player.force, surface, "item")
     local fluid_stats = statistics(player.force, surface, "fluid")
     local function made(type, name) -- вироблено за хвилину (середнє за проміжок)
-      return (flow(type == "fluid" and fluid_stats or item_stats, name, precision))
+      return (flow(type == "fluid" and fluid_stats or item_stats, name, precision, nil, type))
     end
     local total_produced = made(panel.type, panel.name)
     -- частка рецепта у виробництві продукту на цій планеті (за потужністю машин × вихід × продуктивність)
@@ -460,9 +545,18 @@ return function(ctx)
     return tbl
   end
 
+  local function resource_caption(key) -- «[fluid=x] Назва»
+    local type, name = key:match("^([^/]+)/(.+)$")
+    local proto = prototype_of(type, name)
+    return {"", "[" .. type .. "=" .. name .. "] ", proto and proto.localised_name or name}, type, name
+  end
+
+  local BLOCKED_LINES = 3 -- скільки продуктів «забито:» показати в підказці синього лічильника
+
   -- Лічильники машин, що не працюють: кнопка на групу; клік — наступна така машина на мапі.
-  -- key — рецепт або «*buildings:<секція>» (рядок будівель); cursors — які машини вже показано.
-  local function status_buttons(parent, counts, key, cursors)
+  -- key — рецепт або «*buildings:<секція>» (рядок будівель); cursors — які машини вже показано;
+  -- blockers — {[«тип/назва»] = машин} для «вихід повний»: що саме забило вихід (зі знімка сканування).
+  local function status_buttons(parent, counts, key, cursors, blockers)
     for _, group in ipairs(STATUS_GROUPS) do
       local count = counts and counts[group]
       if count and count > 0 then
@@ -470,6 +564,17 @@ return function(ctx)
         local shown = cursors and cursors[key .. "/" .. group]
         local tooltip = {"", {"resbal.status-button", icon, {"resbal.status-" .. group}, count}, "\n", {"resbal.status-click"}}
         if shown then tooltip[#tooltip + 1] = {"resbal.status-shown", math.min(shown, count), count} end
+        if group == "full_output" and blockers then
+          local keys = {}
+          for blocker in pairs(blockers) do keys[#keys + 1] = blocker end
+          table.sort(keys, function(a, b)
+            if blockers[a] == blockers[b] then return a < b end
+            return blockers[a] > blockers[b]
+          end)
+          for i = 1, math.min(BLOCKED_LINES, #keys) do
+            tooltip[#tooltip + 1] = {"resbal.status-blocked", (resource_caption(keys[i])), blockers[keys[i]]}
+          end
+        end
         parent.add{type = "button", style = "resbal_status_button", caption = icon .. count, tooltip = tooltip,
                    tags = {resbal_status = {key = key, group = group}}}
       end
@@ -481,7 +586,7 @@ return function(ctx)
   end
 
   local function flow_row(tbl, sprite, caption, machines, machines_tooltip, rate, rate_tooltip, share, muted,
-                          statuses, status_key, cursors)
+                          statuses, status_key, cursors, blockers)
     if sprite then tbl.add{type = "sprite", sprite = sprite} else tbl.add{type = "empty-widget"} end
     local tooltip = {"", "[font=default-bold]", caption, "[/font]"}
     if rate_tooltip then tooltip[#tooltip + 1] = {"", "\n\n", rate_tooltip} end
@@ -495,7 +600,7 @@ return function(ctx)
     local status = tbl.add{type = "flow", direction = "horizontal"}
     status.style.minimal_width = 150
     status.style.horizontal_spacing = 2
-    if status_key then status_buttons(status, statuses, status_key, cursors) end
+    if status_key then status_buttons(status, statuses, status_key, cursors, blockers) end
     local value = tbl.add{type = "label", caption = rate, tooltip = rate_tooltip}
     value.style.minimal_width = 80
     value.style.horizontal_align = "right"
@@ -508,7 +613,7 @@ return function(ctx)
   end
 
   -- Рядки секції: компоненти окремо, будівлі/обладнання — одним рядком, «Інше» — останнім
-  local function fill_flow_section(tbl, tracker, order, rates, approx, total, other_key, section, cursors)
+  local function fill_flow_section(tbl, tracker, order, rates, approx, total, other_key, section, cursors, hist)
     tbl.clear()
     local shown, rest, rest_count = 0, 0, 0
     local buildings, building_names = 0, {}
@@ -530,10 +635,17 @@ return function(ctx)
         end
       elseif shown < TOP_RECIPES then
         local rate_text = (approx[recipe] and "≈" or "") .. format_number(rate)
+        local machines_tooltip = {"resbal.machines-tooltip", agg.working, agg.total}
+        local shares, covered = history_of(hist, {[recipe] = true})
+        if shares then
+          machines_tooltip = {"", machines_tooltip, "\n",
+                              {"resbal.history-recipe", math.min(covered, hist.minutes), history_parts(shares)}}
+        end
         flow_row(tbl, "recipe/" .. recipe, proto and proto.localised_name or recipe,
-                 agg.working .. "/" .. agg.total, {"resbal.machines-tooltip", agg.working, agg.total},
+                 agg.working .. "/" .. agg.total, machines_tooltip,
                  rate_text, approx[recipe] and {"resbal.rate-approx"} or nil,
-                 total > EPSILON and rate / total or 0, nil, statuses[recipe], recipe, cursors)
+                 total > EPSILON and rate / total or 0, nil, statuses[recipe], recipe, cursors,
+                 (tracker.blockers or {})[recipe])
         shown = shown + 1
       else
         rest, rest_count = rest + rate, rest_count + 1
@@ -568,10 +680,75 @@ return function(ctx)
   local CAUSE_RECIPES = 3 -- скільки головних рецептів-виробників дивитися
   local CAUSE_MAX = 5     -- скільки інгредієнтів показати
 
-  local function fill_cause(flow, player, panel, precision_index, produced_rates, balance)
+  -- Чи вважати ресурс дефіцитним для підказок — з гістерезисом: з'являється при від'ємному балансі, зникає лише
+  -- при явному плюсі (> 1% споживання, мінімум 0.1/хв). Інакше в «Наживо» баланс біля нуля щосекунди
+  -- перескакує знак і підказки блимають. Стан — у трекері (новий ресурс — новий трекер).
+  -- Ціль випуску (задається в діалозі сторожа): висновок — ціль досягнута, бракує потужності машин,
+  -- або потужності вистачає, а машини стоять (без входу / вихід повний / енергія). Потужність — зі сканування:
+  -- швидкість машин × вихід за крафт × (1 + продуктивність). «Скільки машин додати» — лише для головного
+  -- рецепта (з найбільшою кількістю машин), тому це оцінка.
+  local TARGET_REACHED = 0.95
+  local IDLE_REASONS = {"no_input", "full_output", "power", "other"}
+
+  local function fill_target(label, player, tracker, produced)
+    if not label then return end -- вкладку побудовано до оновлення мода
+    label.visible = false
+    local target = ctx.target_of(player, tracker.panel)
+    if not (target and tracker.recipes) then return end
+    local capacity, main, main_per_machine, groups = 0, nil, 0, {}
+    for recipe, amount in pairs(producers_of(key_of(tracker.panel))) do
+      local agg = tracker.recipes[recipe]
+      if agg and agg.total > 0 then
+        local per_minute = agg.capacity * amount * (1 + agg.productivity) * 60
+        capacity = capacity + per_minute
+        if not main or agg.total > main.total then
+          main, main_per_machine = {name = recipe, total = agg.total}, per_minute / agg.total
+        end
+        for group, count in pairs((tracker.statuses or {})[recipe] or {}) do groups[group] = (groups[group] or 0) + count end
+      end
+    end
+    local head = {"resbal.target-head", format_number(target), format_number(produced),
+                  string.format("%.0f", produced / target * 100)}
+    local verdict, color
+    if produced >= target * TARGET_REACHED then
+      verdict = capacity > 0 and {"resbal.target-reached", string.format("%.0f", math.max(0, capacity / target - 1) * 100)}
+                or {"resbal.target-reached-plain"}
+      color = {0.45, 0.9, 0.45}
+    elseif capacity < target * 0.98 then
+      if main and main_per_machine > 0 then
+        local proto = prototypes.recipe[main.name]
+        verdict = {"resbal.target-capacity", format_number(capacity), math.ceil((target - capacity) / main_per_machine),
+                   proto and proto.localised_name or main.name}
+      else
+        verdict = {"resbal.target-no-machines"}
+      end
+      color = {1, 0.6, 0.3}
+    else
+      local reason, most = "other", 0
+      for _, group in ipairs(IDLE_REASONS) do
+        if (groups[group] or 0) > most then reason, most = group, groups[group] end
+      end
+      verdict = {"resbal.target-idle-" .. reason, format_number(capacity)}
+      color = {1, 0.85, 0.3}
+    end
+    label.caption = {"", head, " ", verdict}
+    label.style.font_color = color
+    label.visible = true
+  end
+
+  local function deficit_state(tracker, consumed, balance)
+    if balance < -EPSILON then
+      tracker.short = true
+    elseif balance > math.max(0.1, consumed * 0.01) then
+      tracker.short = false
+    end
+    return tracker.short == true
+  end
+
+  local function fill_cause(flow, player, panel, precision_index, produced_rates, short)
     flow.clear()
     flow.visible = false
-    if balance >= -EPSILON then return end
+    if not short then return end
     -- головні виробники: за виміряним/оціненим внеском; якщо все стоїть — ті, що є на планеті (внесок 0)
     local recipes = {}
     for recipe, rate in pairs(produced_rates) do recipes[#recipes + 1] = {name = recipe, rate = rate} end
@@ -610,17 +787,60 @@ return function(ctx)
       button.style.font_color = COLOR_NEGATIVE
       button.style.hovered_font_color = COLOR_NEGATIVE
     end
+    local deeper = flow.add{type = "button", name = "resbal_root_open", caption = {"resbal.root-open"},
+                            tooltip = {"resbal.root-open-tooltip"}}
+    deeper.style.left_margin = 8
   end
 
   -- Підказка «перевір доставку»: ресурс у дефіциті, а помітна частка його виробників стоїть із повним
   -- виходом — отже, біда не у виробництві, а в тому, що продукт (чи побічний продукт) не забирають.
   -- Стани — зі знімка перепошуку (tracker.statuses), тож підказка не блимає між оновленнями.
   local DELIVERY_SHARE = 0.1 -- від якої частки виробників із повним виходом показувати
+  local STARVING_SHARE = 0.1 -- від якої частки машин-споживачів «без входу» вважаємо, що споживачі голодують
 
-  local function fill_delivery(label, tracker, produced_rates, balance)
-    if not label then return end -- вкладку побудовано до оновлення мода
-    label.visible = false
-    if balance >= -EPSILON then return end
+  -- Стани машин набору рецептів зі знімка сканування: {група = машин}, усього машин
+  local function group_counts(tracker, rates)
+    local statuses = tracker.statuses or {}
+    local counts, total = {}, 0
+    for recipe in pairs(rates) do
+      for group, count in pairs(statuses[recipe] or {}) do
+        counts[group] = (counts[group] or 0) + count
+        total = total + count
+      end
+    end
+    return counts, total
+  end
+
+  -- «Буфер»: помітна частка виробників стоїть із повним виходом, а споживачі НЕ голодують — склад (станція,
+  -- резервуари) повний, споживання йде з запасу. Типово для міських блоків і потягів: за коротким проміжком
+  -- баланс від'ємний, але це не дефіцит. Без машин-споживачів (споживає не рецепт) — не визначаємо.
+  local function buffer_state(tracker, produced_rates, consumed_rates)
+    local produced, produced_total = group_counts(tracker, produced_rates)
+    if produced_total == 0 or (produced.full_output or 0) < produced_total * DELIVERY_SHARE then return false end
+    local consumed, consumed_total = group_counts(tracker, consumed_rates)
+    if consumed_total == 0 then return false end
+    return (consumed.no_input or 0) < consumed_total * STARVING_SHARE
+  end
+
+  local BLUE = "[img=utility/status_blue]"
+  local BYPRODUCT_OTHERS = 3 -- скільки інших блокувальників перелічити в підказці
+
+  -- Стан споживачів побічного продукту на планеті (за рецептами з останнього перепошуку)
+  local function consumers_state(tracker, type, name)
+    local total, working = 0, 0
+    for recipe in pairs(consumers_of(type, name)) do
+      local agg = tracker.recipes and tracker.recipes[recipe]
+      if agg then total, working = total + agg.total, working + agg.working end
+    end
+    if total == 0 then return {"resbal.byproduct-none"} end
+    if working == 0 then return {"resbal.byproduct-stopped", total} end
+    return {"resbal.byproduct-working", working, total}
+  end
+
+  local function fill_delivery(flow, tracker, panel, produced_rates, short)
+    if not (flow and flow.type == "flow") then return end -- вкладку побудовано до оновлення мода
+    flow.visible = false
+    if not short then return end
     local statuses = tracker.statuses or {}
     local full, total = 0, 0
     for recipe in pairs(produced_rates) do
@@ -630,8 +850,52 @@ return function(ctx)
       end
     end
     if full == 0 or full < total * DELIVERY_SHARE then return end
-    label.caption = {"resbal.delivery", "[img=utility/status_blue]", full, total}
-    label.visible = true
+
+    -- що саме блокує: сума по рецептах-виробниках; для «показати машину» — рецепт, де головного найбільше
+    local by_key, top_recipe = {}, {}
+    for recipe in pairs(produced_rates) do
+      for key, count in pairs((tracker.blockers or {})[recipe] or {}) do
+        by_key[key] = (by_key[key] or 0) + count
+        if not top_recipe[key] or count > top_recipe[key].count then top_recipe[key] = {recipe = recipe, count = count} end
+      end
+    end
+    local keys = {}
+    for key in pairs(by_key) do keys[#keys + 1] = key end
+    table.sort(keys, function(a, b)
+      if by_key[a] == by_key[b] then return a < b end
+      return by_key[a] > by_key[b]
+    end)
+    local main = keys[1]
+
+    local text, buttons = flow.resbal_delivery_text, flow.resbal_delivery_buttons
+    buttons.clear()
+    flow.visible = true
+    if not main or main == key_of(panel) or not prototype_of(main:match("^([^/]+)/(.+)$")) then
+      -- блокує сам ресурс або визначити не вдалося — загальна підказка про доставку
+      text.caption = {"resbal.delivery", BLUE, full, total}
+      text.tooltip = {"resbal.delivery-tooltip"}
+      buttons.visible = false
+      return
+    end
+
+    local caption, type, name = resource_caption(main)
+    text.caption = {"", {"resbal.byproduct", BLUE, by_key[main], total, caption}, " ", consumers_state(tracker, type, name)}
+    local tooltip = {"", {"resbal.byproduct-tooltip"}}
+    local others = 0
+    for i = 2, #keys do
+      if keys[i] ~= key_of(panel) and others < BYPRODUCT_OTHERS then
+        others = others + 1
+        tooltip[#tooltip + 1] = {"resbal.byproduct-other", (resource_caption(keys[i])), by_key[keys[i]]}
+      end
+    end
+    text.tooltip = tooltip
+    buttons.visible = true
+    buttons.add{type = "button", style = "resbal_status_button", caption = {"resbal.byproduct-consumers", "[" .. type .. "=" .. name .. "]"},
+                tooltip = {"resbal.byproduct-consumers-tooltip", caption},
+                tags = {resbal_chart = {type = type, name = name, surface = panel.surface}}}
+    buttons.add{type = "button", style = "resbal_status_button", caption = {"resbal.byproduct-show", BLUE},
+                tooltip = {"resbal.byproduct-show-tooltip"},
+                tags = {resbal_status = {key = top_recipe[main].recipe, group = "full_output"}}}
   end
 
   -- «· стан машин — N с тому» (знімок останнього перепошуку)
@@ -673,8 +937,13 @@ return function(ctx)
     end
 
     local balance = total_produced - total_consumed
-    fill_cause(content.resbal_flow_cause, player, panel, precision_index, produced_rates, balance)
-    fill_delivery(content.resbal_flow_delivery, tracker, produced_rates, balance)
+    local short = deficit_state(tracker, total_consumed, balance)
+    -- буфер повний, споживачі працюють — не дефіцит: замість причин і «перевір доставку» — нейтральний рядок
+    local buffered = short and buffer_state(tracker, produced_rates, consumed_rates)
+    if content.resbal_flow_buffer then content.resbal_flow_buffer.visible = buffered == true end
+    fill_cause(content.resbal_flow_cause, player, panel, precision_index, produced_rates, short and not buffered)
+    fill_delivery(content.resbal_flow_delivery, tracker, panel, produced_rates, short and not buffered)
+    fill_target(content.resbal_flow_target, player, tracker, total_produced)
     content.resbal_flow_header.caption = {"resbal.flow-header", rich_icon(panel), format_number(total_produced),
                                           format_number(total_consumed),
                                           (balance > EPSILON and "+" or "") .. format_number(balance),
@@ -686,6 +955,20 @@ return function(ctx)
     else
       content.resbal_flow_status.caption = {"", {"resbal.flow-estimated", {"resbal.p-" .. PRECISIONS[precision_index]}},
                                             status_age(tracker)}
+    end
+
+    -- історія станів виробників (фоновий облік): на що пішов час за останні N хвилин
+    local hist = history_context(player, panel, live and "one_minute" or PRECISIONS[precision_index])
+    local history_label = content.resbal_flow_history
+    if history_label then -- вкладку побудовано до оновлення мода — рядка немає
+      local shares, covered = history_of(hist, produced_rates)
+      if not machines.enabled() then
+        history_label.caption = {"resbal.history-off"}
+      elseif not shares then
+        history_label.caption = {"resbal.history-collecting"}
+      else
+        history_label.caption = {"resbal.history-line", math.min(covered, hist.minutes), history_parts(shares)}
+      end
     end
 
     -- порядок рядків: у режимі «наживо» оновлюємо рідше, щоб рядки не стрибали щосекунди
@@ -701,7 +984,7 @@ return function(ctx)
         tracker.order[key] = names
       end
       fill_flow_section(content[table_name], tracker, tracker.order[key], rates, approx, total, other_key, key,
-                        state.cursors)
+                        state.cursors, hist)
     end
     state.flow_next = game.tick + (live and TRACK_POLL or STATS_REFRESH)
   end
@@ -834,26 +1117,195 @@ return function(ctx)
     content.style.maximal_height = 600
     content.style.minimal_width = 760
     content.style.top_margin = 6
+    local tools = content.add{type = "flow", direction = "horizontal"}
+    tools.add{type = "empty-widget"}.style.horizontally_stretchable = true
+    tools.add{type = "button", name = "resbal_chain_open", caption = {"resbal.chain-open"},
+              tooltip = {"resbal.chain-open-tooltip"}}
     content.add{type = "label", name = "resbal_flow_header", caption = "", style = "bold_label"}
+    local target = content.add{type = "label", name = "resbal_flow_target", caption = "",
+                               tooltip = {"resbal.target-verdict-tooltip"}}
+    target.style.single_line = false
+    target.style.maximal_width = 740
+    target.visible = false
     local status = content.add{type = "label", name = "resbal_flow_status", caption = ""}
     status.style.font_color = {0.7, 0.7, 0.7}
+    local history = content.add{type = "label", name = "resbal_flow_history", caption = "",
+                                tooltip = {"resbal.history-tooltip"}}
+    history.style.single_line = false
+    history.style.maximal_width = 740
     local cause = content.add{type = "flow", name = "resbal_flow_cause", direction = "horizontal"}
     cause.style.vertical_align = "center"
     cause.style.horizontal_spacing = 4
     cause.style.top_margin = 4
     cause.visible = false
-    local delivery = content.add{type = "label", name = "resbal_flow_delivery", caption = "",
-                                 tooltip = {"resbal.delivery-tooltip"}}
-    delivery.style.single_line = false
-    delivery.style.maximal_width = 740
-    delivery.style.font_color = {1, 0.85, 0.3}
+    -- «буфер повний»: виробники чекають, споживачі працюють із запасу — не дефіцит
+    local buffer = content.add{type = "label", name = "resbal_flow_buffer", caption = {"resbal.buffer"},
+                               tooltip = {"resbal.buffer-tooltip"}}
+    buffer.style.single_line = false
+    buffer.style.maximal_width = 740
+    buffer.style.font_color = {0.6, 0.8, 1}
+    buffer.style.top_margin = 4
+    buffer.visible = false
+    -- «перевір доставку» / «забитий побічний продукт»: текст + кнопки (хто споживає, показати машину)
+    local delivery = content.add{type = "flow", name = "resbal_flow_delivery", direction = "vertical"}
     delivery.style.top_margin = 4
+    delivery.style.vertical_spacing = 2
     delivery.visible = false
+    local delivery_text = delivery.add{type = "label", name = "resbal_delivery_text", caption = ""}
+    delivery_text.style.single_line = false
+    delivery_text.style.maximal_width = 740
+    delivery_text.style.font_color = {1, 0.85, 0.3}
+    local delivery_buttons = delivery.add{type = "flow", name = "resbal_delivery_buttons", direction = "horizontal"}
+    delivery_buttons.style.horizontal_spacing = 4
     flow_section(content, "resbal_flow_producers", {"resbal.producers"})
     flow_section(content, "resbal_flow_consumers", {"resbal.consumers"})
     update_flow_tab(player)
   end
 
 
-  return {step_rescan = step_rescan, update_flow_tab = update_flow_tab, show_next_machine = show_next_machine, build_flow_tab = build_flow_tab}
+  -- Кандидати для «Створити список з інгредієнтів»: ресурс + безпосередні інгредієнти його рецептів-виробників.
+  -- Рецепти — ті, що зараз стоять у машинах на планеті (за останнім скануванням); якщо машин немає —
+  -- усі відкриті силою рецепти-виробники. Один рівень, без дублікатів.
+  local CHAIN_MAX = 40
+
+  local function chain_candidates(player)
+    local state = big_state(player)
+    local tracker = state and state.tracker
+    if not tracker then return nil end
+    local panel = tracker.panel
+    local key = key_of(panel)
+    local recipes = {}
+    for recipe in pairs(producers_of(key)) do
+      local agg = tracker.recipes and tracker.recipes[recipe]
+      if agg and agg.total > 0 then recipes[#recipes + 1] = {name = recipe, machines = agg.total} end
+    end
+    local from_scan = #recipes > 0
+    if not from_scan then
+      local force_recipes = player.force.recipes
+      for recipe in pairs(producers_of(key)) do
+        local known = force_recipes[recipe]
+        local proto = prototypes.recipe[recipe]
+        if known and known.enabled and proto and not proto.hidden then recipes[#recipes + 1] = {name = recipe, machines = 0} end
+      end
+    end
+    table.sort(recipes, function(a, b)
+      if a.machines == b.machines then return a.name < b.name end
+      return a.machines > b.machines
+    end)
+    local items, seen = {{type = panel.type, name = panel.name}}, {[key] = true}
+    for _, recipe in ipairs(recipes) do
+      local proto = prototypes.recipe[recipe.name]
+      for _, ingredient in ipairs(proto and proto.ingredients or {}) do
+        local ingredient_key = ingredient.type .. "/" .. ingredient.name
+        if not seen[ingredient_key] and #items < CHAIN_MAX and prototype_of(ingredient.type, ingredient.name) then
+          seen[ingredient_key] = true
+          items[#items + 1] = {type = ingredient.type, name = ingredient.name, recipe = recipe.name}
+        end
+      end
+    end
+    return {items = items, recipes = #recipes, from_scan = from_scan, surface = panel.surface}
+  end
+
+  -- «Знайти першопричини»: обхід ланцюжка вглиб від ресурсу в дефіциті (та сама планета й проміжок).
+  -- Для вузла — рецепти-виробники, що стоять у машинах на планеті (скан охоплює всі машини), їхні інгредієнти
+  -- в дефіциті — діти. Кінець ланцюжка — вузол без дефіцитних інгредієнтів або зупинка пошуку; verdict:
+  --   capacity — машини майже всі працюють (бракує потужності); idle — машини стоять, хоча інгредієнтів
+  --   вистачає; none — машин із його рецептами на планеті немає; seen — вже розглянуто в іншій гілці (або
+  --   цикл); limit — обмеження глибини чи кількості вузлів.
+  local ROOT_DEPTH = 5
+  local ROOT_NODES = 30
+  local ROOT_WORKING = 0.9 -- від цієї частки працюючих машин — «бракує потужності»
+
+  local function root_causes(player)
+    local state = big_state(player)
+    local tracker = state and state.tracker
+    if not (tracker and tracker.recipes) then return nil end
+    local panel = tracker.panel
+    local precision_index = state.flow_mode == "live" and 2 or (state.flow_precision or 2)
+    local precision = defines.flow_precision_index[PRECISIONS[precision_index]]
+    local visited, count = {}, 0
+
+    -- «Буфер» для вузла дерева (за фоновою історією станів, 5 хв): виробники помітно стоять із повним виходом,
+    -- а споживачі не голодують — склад повний, це не причина дефіциту. Без історії — не визначаємо.
+    local hist = machines.enabled() and history_context(player, panel, "one_minute")
+    local function buffered(key, type, name)
+      if not hist then return false end
+      local produced = machines.shares(hist.force, hist.surfaces, producers_of(key), hist.minutes, hist.tick)
+      if not produced or (produced.full_output or 0) < 0.25 then return false end
+      local consumed = machines.shares(hist.force, hist.surfaces, consumers_of(type, name), hist.minutes, hist.tick)
+      return consumed ~= nil and (consumed.no_input or 0) < STARVING_SHARE
+    end
+
+    local function balance_of(type, name)
+      local produced, consumed = flow_sum(sources(player.force, panel.surface, type, name), name, precision)
+      return produced - consumed
+    end
+
+    local function expand(type, name, balance, depth)
+      local key = type .. "/" .. name
+      visited[key] = true
+      count = count + 1
+      local node = {type = type, name = name, balance = balance, children = {}}
+      local recipes, total, working = {}, 0, 0
+      for recipe in pairs(producers_of(key)) do
+        local agg = tracker.recipes[recipe]
+        if agg and agg.total > 0 then
+          recipes[#recipes + 1] = {name = recipe, total = agg.total}
+          total, working = total + agg.total, working + agg.working
+        end
+      end
+      node.total, node.working = total, working
+      if total == 0 then
+        node.verdict = "none"
+        return node
+      end
+      table.sort(recipes, function(a, b)
+        if a.total == b.total then return a.name < b.name end
+        return a.total > b.total
+      end)
+      local deficits, checked = {}, {}
+      for i = 1, math.min(CAUSE_RECIPES, #recipes) do
+        local proto = prototypes.recipe[recipes[i].name]
+        for _, ingredient in ipairs(proto and proto.ingredients or {}) do
+          local ingredient_key = ingredient.type .. "/" .. ingredient.name
+          if ingredient_key ~= key and not checked[ingredient_key] and prototype_of(ingredient.type, ingredient.name) then
+            checked[ingredient_key] = true
+            local ingredient_balance = balance_of(ingredient.type, ingredient.name)
+            if ingredient_balance < -EPSILON then
+              deficits[#deficits + 1] = {type = ingredient.type, name = ingredient.name, balance = ingredient_balance}
+            end
+          end
+        end
+      end
+      if #deficits == 0 then
+        if buffered(key, type, name) then
+          node.verdict = "buffer"
+        else
+          node.verdict = working >= total * ROOT_WORKING and "capacity" or "idle"
+        end
+        return node
+      end
+      table.sort(deficits, function(a, b) return a.balance < b.balance end)
+      for _, deficit in ipairs(deficits) do
+        local child
+        if visited[deficit.type .. "/" .. deficit.name] then
+          child = {type = deficit.type, name = deficit.name, balance = deficit.balance, children = {}, verdict = "seen"}
+        elseif buffered(deficit.type .. "/" .. deficit.name, deficit.type, deficit.name) then
+          child = {type = deficit.type, name = deficit.name, balance = deficit.balance, children = {}, verdict = "buffer"}
+        elseif depth >= ROOT_DEPTH or count >= ROOT_NODES then
+          child = {type = deficit.type, name = deficit.name, balance = deficit.balance, children = {}, verdict = "limit"}
+        else
+          child = expand(deficit.type, deficit.name, deficit.balance, depth + 1)
+        end
+        node.children[#node.children + 1] = child
+      end
+      return node
+    end
+
+    local root = expand(panel.type, panel.name, balance_of(panel.type, panel.name), 1)
+    return {root = root, surface = panel.surface, precision = PRECISIONS[precision_index]}
+  end
+
+  return {step_rescan = step_rescan, update_flow_tab = update_flow_tab, show_next_machine = show_next_machine,
+          build_flow_tab = build_flow_tab, chain_candidates = chain_candidates, root_causes = root_causes}
 end

@@ -1,6 +1,12 @@
 local mod_gui = require("mod-gui")
 local lists = require("scripts.lists") -- кілька списків ресурсів (вкладки)
 local marks = require("scripts.marks") -- позначки на великому графіку
+local watchlog = require("scripts.watchlog") -- журнал спрацювань сторожа
+local chain = require("scripts.chain") -- «створити список з інгредієнтів»
+local rootcause = require("scripts.rootcause") -- «знайти першопричини»
+local machines = require("scripts.machines") -- фоновий облік станів машин (історія простою)
+local idle = require("scripts.idle") -- вікно «Простої фабрики»
+local fluidstock = require("scripts.fluidstock") -- запас рідин у резервуарах (колонка «Запас»)
 
 -- Проміжки часу, як у вбудованому вікні виробництва
 local PRECISIONS = {
@@ -286,10 +292,39 @@ local function sane(value)
   return value
 end
 
-local function flow(stats, name, precision, sample_index)
-  -- input = вироблено, output = спожито; значення за хвилину
-  return sane(stats.get_flow_count{name = name, category = "input", precision_index = precision, sample_index = sample_index}),
-         sane(stats.get_flow_count{name = name, category = "output", precision_index = precision, sample_index = sample_index})
+-- Якості предметів. get_flow_count / get_input_count / get_item_count з простим ім'ям рахують лише
+-- normal (перевірено в 2.1: 20 normal + 20 uncommon → 20), тож для предметів сумуємо по всіх якостях.
+-- Без Space Age якість одна — викликів стільки ж, як і раніше. Список будується ліниво (prototypes
+-- незмінні під час гри, порядок pairs однаковий у всіх гравців).
+local quality_list
+local function qualities()
+  if not quality_list then
+    quality_list = {}
+    for name in pairs(prototypes.quality) do
+      if name ~= "quality-unknown" then quality_list[#quality_list + 1] = name end
+    end
+    if #quality_list == 0 then quality_list[1] = "normal" end
+  end
+  return quality_list
+end
+
+-- Сума count_of({name, quality}) по всіх якостях предмета; для рідин — один виклик з іменем
+local function by_quality(type, name, count_of)
+  if type == "fluid" then return count_of(name) end
+  local total = 0
+  for _, quality in ipairs(qualities()) do total = total + count_of({name = name, quality = quality}) end
+  return total
+end
+
+local function flow(stats, name, precision, sample_index, type)
+  -- input = вироблено, output = спожито; значення за хвилину; type — "item" (за замовчуванням) або "fluid"
+  local function count(category)
+    return by_quality(type, name, function(id)
+      return sane(stats.get_flow_count{name = id, category = category, precision_index = precision,
+                                       sample_index = sample_index})
+    end)
+  end
+  return count("input"), count("output")
 end
 
 -- Поверхні запису: одна за назвою або, для «Усіх планет», усі, крім службової
@@ -312,8 +347,9 @@ local function sources(force, surface_name, type, name, get_stats)
   local list = {}
   for _, surface in ipairs(surfaces_of(surface_name)) do
     local stats = get_stats(surface, type)
-    if surface_name ~= ALL_SURFACES or stats.get_input_count(name) > 0 or stats.get_output_count(name) > 0 then
-      list[#list + 1] = {surface = surface, stats = stats}
+    if surface_name ~= ALL_SURFACES or by_quality(type, name, function(id) return stats.get_input_count(id) end) > 0
+       or by_quality(type, name, function(id) return stats.get_output_count(id) end) > 0 then
+      list[#list + 1] = {surface = surface, stats = stats, type = type}
     end
   end
   return list
@@ -323,7 +359,7 @@ end
 local function flow_sum(list, name, precision, sample_index)
   local produced, consumed = 0, 0
   for _, source in ipairs(list) do
-    local p, c = flow(source.stats, name, precision, sample_index)
+    local p, c = flow(source.stats, name, precision, sample_index, source.type)
     produced, consumed = produced + p, consumed + c
   end
   return produced, consumed
@@ -337,12 +373,19 @@ end
 -- Запас предмета в логістичних мережах поверхні (або всіх поверхонь для «Усіх планет»).
 -- Рідини в логістику не потрапляють — для них nil. Стрічки й скрині поза мережею не враховуються.
 local function logistic_stock(networks, type, name, surface_name)
+  if type == "fluid" then -- рідини — у резервуарах (з трубами їхніх сегментів), scripts/fluidstock.lua
+    local total = 0
+    for _, surface in ipairs(surfaces_of(surface_name)) do
+      if surface and surface.valid then total = total + fluidstock.amount(surface.index, name) end
+    end
+    return total
+  end
   if type ~= "item" then return nil end
   local total = 0
   for surface, list in pairs(networks) do
     if surface_name == ALL_SURFACES or surface == surface_name then
       for _, network in ipairs(list) do
-        if network.valid then total = total + network.get_item_count(name) end
+        if network.valid then total = total + by_quality(type, name, function(id) return network.get_item_count(id) end) end
       end
     end
   end
@@ -361,7 +404,7 @@ local function collect_rows(player, data)
       local stats = get_stats(surface, type)
       for name in pairs(stats.output_counts) do -- кандидати: лише те, що колись споживалось
         if prototype_of(type, name) then
-          local produced, consumed = flow(stats, name, precision)
+          local produced, consumed = flow(stats, name, precision, nil, type)
           if produced - consumed < -EPSILON then
             rows[#rows + 1] = {type = type, name = name, surface_name = surface.name,
                                produced = produced, consumed = consumed}
@@ -379,7 +422,7 @@ local function collect_rows(player, data)
           -- розбивка по поверхнях для підказки
           row.parts = {}
           for _, source in ipairs(list) do
-            local p, c = flow(source.stats, entry.name, precision)
+            local p, c = flow(source.stats, entry.name, precision, nil, source.type)
             row.parts[#row.parts + 1] = {surface = source.surface, produced = p, consumed = c}
             row.produced, row.consumed = row.produced + p, row.consumed + c
           end
@@ -522,9 +565,23 @@ end
 
 -- Робить «відкритим» велике вікно, якщо воно є, інакше панель (за налаштуванням), інакше нічого.
 -- Чужі вікна (інвентар тощо) не чіпаємо, якщо ставити нічого.
+-- Діалоги мода (сторож, позначки, журнал, списки): поки відкритий — саме він закривається на Esc
+local DIALOGS = {"resbal_watch", "resbal_marks", "resbal_watchlog", "resbal_list_dialog", "resbal_chain_dialog",
+                 "resbal_rootcause", "resbal_idle"}
+local DIALOG_NAMES = {}
+for _, name in ipairs(DIALOGS) do DIALOG_NAMES[name] = true end
+
+local function top_dialog(player)
+  for _, name in ipairs(DIALOGS) do
+    local dialog = player.gui.screen[name]
+    if dialog then return dialog end
+  end
+  return nil
+end
+
 local function update_opened(player)
   if not player.connected then return end
-  local target = player.gui.screen.resbal_big
+  local target = top_dialog(player) or player.gui.screen.resbal_big
   if not target and player.mod_settings["resbal-close-on-esc"].value then target = main_frame(player) end
   if target then
     if player.opened == target then return end
@@ -634,14 +691,15 @@ local function set_stock(label, row, data)
   end
   local deficit = row.consumed - row.produced
   local where = {"resbal.p-" .. PRECISIONS[data.precision]}
+  local kind = row.type == "fluid" and "-fluid" or "" -- рідини: «у резервуарах» замість «у логістичних мережах»
   if deficit <= EPSILON then
     label.caption, label.style.font_color = "—", COLOR_NEUTRAL
-    label.tooltip = {"resbal.stock-ok", format_number(row.stock), where}
+    label.tooltip = {"resbal.stock-ok" .. kind, format_number(row.stock), where}
     return
   end
-  if row.stock <= 0 then -- дефіцит, а в мережах нічого немає
+  if row.stock <= 0 then -- дефіцит, а в мережах (резервуарах) нічого немає
     label.caption, label.style.font_color = "0", COLOR_NEGATIVE
-    label.tooltip = {"resbal.stock-empty", format_number(deficit), where}
+    label.tooltip = {"resbal.stock-empty" .. kind, format_number(deficit), where}
     return
   end
   local minutes = row.stock / deficit
@@ -649,7 +707,7 @@ local function set_stock(label, row, data)
   label.caption = lasts
   label.style.font_color = minutes < STOCK_RED and COLOR_NEGATIVE
                         or minutes < STOCK_YELLOW and {1, 0.85, 0.3} or COLOR_NEUTRAL
-  label.tooltip = {"resbal.stock-tooltip", format_number(row.stock), format_number(deficit), lasts, where}
+  label.tooltip = {"resbal.stock-tooltip" .. kind, format_number(row.stock), format_number(deficit), lasts, where}
 end
 
 local function header(tbl, key, caption, data, width, align, tooltip)
@@ -781,6 +839,9 @@ local function fill_slot(player, tbl, i, row, data, view, budget)
   -- повна назва першим рядком: довга назва в таблиці обрізається
   local open_tooltip = {"", "[font=default-bold]", title, "[/font]\n", caption, "\n\n",
                         {"resbal.open-chart"}}
+  if row.type == "item" and #qualities() > 1 then -- є якості (Space Age): числа — сума всіх
+    open_tooltip[#open_tooltip + 1] = {"resbal.all-qualities"}
+  end
   local resource = tbl["resbal_res_" .. i].content
   local icon = resource.res_icon
   icon.sprite = proto and (row.type .. "/" .. row.name) or "utility/questionmark"
@@ -788,7 +849,18 @@ local function fill_slot(player, tbl, i, row, data, view, budget)
   resource.res_name.caption = title
   resource.res_name.tooltip = open_tooltip
 
-  tbl["resbal_prod_" .. i].content.amount.caption = format_number(row.produced)
+  -- «Вироблено»: якщо задано ціль випуску — жовтий нижче 95% цілі, у підказці відсоток
+  local produced_label = tbl["resbal_prod_" .. i].content.amount
+  produced_label.caption = format_number(row.produced)
+  local target = row.entry_index and data.entries[row.entry_index] and data.entries[row.entry_index].target
+  if target then
+    local share = row.produced / target
+    produced_label.style.font_color = share < 0.95 and {1, 0.85, 0.3} or {1, 1, 1}
+    produced_label.tooltip = {"resbal.target-tooltip", format_number(target), string.format("%.0f", share * 100)}
+  else
+    produced_label.style.font_color = {1, 1, 1}
+    produced_label.tooltip = nil
+  end
   tbl["resbal_cons_" .. i].content.amount.caption = format_number(row.consumed)
   set_balance(tbl["resbal_bal_" .. i].content.amount, row.produced, row.consumed)
   set_stock(tbl["resbal_stock_" .. i].content.amount, row, data)
@@ -909,6 +981,8 @@ local function build(player)
                                        or {"resbal.watch-state-on"},
                              style = data.lists[data.active].watch_paused and "red_button" or "button"}
   pause.style.left_margin = 16
+  watchlog.add_button(controls)
+  idle.add_button(controls)
   controls.add{type = "empty-widget"}.style.horizontally_stretchable = true
   controls.add{type = "sprite", sprite = "utility/search", tooltip = {"resbal.search-tooltip"}}
   local search = controls.add{type = "textfield", name = "resbal_search", text = data.search,
@@ -1029,6 +1103,7 @@ local function open_watch(player, entry_index)
   end
   field("resbal_watch_prod", {"resbal.watch-min-produced"}, {"resbal.watch-min-produced-tooltip"}, watch.min_produced, false)
   field("resbal_watch_bal", {"resbal.watch-min-balance"}, {"resbal.watch-min-balance-tooltip"}, watch.min_balance, true)
+  field("resbal_watch_target", {"resbal.target"}, {"resbal.target-field-tooltip"}, entry.target, false)
 
   local windows = inner.add{type = "flow", name = "windows", direction = "horizontal"}
   windows.style.top_margin = 8
@@ -1093,14 +1168,27 @@ local function save_watch(player, remove)
   local tags = frame.tags
   local entry = find_entry(player_data(player), tags)
   if entry then
-    local produced = tonumber(frame.inner.fields.resbal_watch_prod.text)
-    local balance = tonumber(frame.inner.fields.resbal_watch_bal.text)
+    local fields = frame.inner.fields
+    local produced = tonumber(fields.resbal_watch_prod.text)
+    produced = produced and math.max(0, produced)
+    local balance = tonumber(fields.resbal_watch_bal.text)
+    local old = entry.watch
+    local same = old and not remove and old.min_produced == produced and old.min_balance == balance
+                 and (old.window or DEFAULT_WATCH_WINDOW) == tags.window
+    if old and old.violated and not same then -- поріг змінили чи видалили посеред порушення
+      marks.add_auto(player, entry, "changed", {since = old.violated_since})
+      watchlog.close(player, old.log_id, "changed")
+    end
     if remove or (produced == nil and balance == nil) then
       entry.watch = nil
-    else
-      local snooze_until = entry.watch and entry.watch.snooze_until
-      entry.watch = {min_produced = produced and math.max(0, produced), min_balance = balance, window = tags.window,
-                     snooze_until = snooze_until}
+    elseif not same then -- пороги ті самі — сторож лишається як є (стан порушення, журнал, відкладення)
+      entry.watch = {min_produced = produced, min_balance = balance, window = tags.window,
+                     snooze_until = old and old.snooze_until}
+    end
+    -- ціль випуску — окремо від сторожа (кнопка «Видалити сторожа» її не чіпає)
+    if not remove then
+      local target = fields.resbal_watch_target and tonumber(fields.resbal_watch_target.text)
+      entry.target = (target and target > 0) and target or nil
     end
   end
   frame.destroy()
@@ -1516,14 +1604,14 @@ local function draw_big(player)
     label.caption = {"resbal.t-" .. unit, short_number(range * (1 - (index - 1) / 5) / divisor)}
   end
 
-  -- позначки гравця: блакитні пунктирні лінії на всю висоту; текст — у підказці колонки
+  -- позначки гравця: пунктирні лінії на всю висоту (ручні — блакитні, сторожа — за видом); текст — у підказці
   local sample_seconds = range / 300
   local shown_marks = {}
-  for _, mark in ipairs(marks.visible(player_data(player), range)) do
+  for _, mark in ipairs(marks.visible(player_data(player), range, state.panels)) do
     local k = BIG_SAMPLES + 1 - mark.ago / sample_seconds -- той самий відлік, що й у підписах «тому»
     if k >= 1 then
       local x = x_of(math.min(k, BIG_SAMPLES))
-      objects[#objects + 1] = rendering.draw_line{color = {0.4, 0.75, 1}, width = 2, from = at(x, 0), to = at(x, total_h),
+      objects[#objects + 1] = rendering.draw_line{color = marks.color(mark.auto), width = 2, from = at(x, 0), to = at(x, total_h),
                                                   dash_length = 6 / TILE, gap_length = 4 / TILE,
                                                   surface = surface, players = players}
       mark.k = k
@@ -1552,7 +1640,7 @@ local function draw_big(player)
       if mark.k >= first - 0.5 and mark.k <= last + 0.5 and in_column < 3 then
         in_column = in_column + 1
         local ago_unit, ago_divisor = time_axis(mark.ago)
-        tooltip[#tooltip + 1] = {"resbal.mark-line", mark.text ~= "" and mark.text or "—",
+        tooltip[#tooltip + 1] = {"resbal.mark-line", marks.colored(mark.auto, mark.text ~= "" and mark.text or "—"),
                                  {"resbal.t-" .. ago_unit, short_number(mark.ago / ago_divisor)}}
       end
     end
@@ -1564,6 +1652,18 @@ end
 
 -- ---------- виробники й споживачі (модуль scripts/flow.lua) ----------
 local flow_tab = require("scripts.flow")({
+  -- ціль випуску ресурсу панелі: з будь-якого списку гравця (спершу відкритий), або nil
+  target_of = function(player, panel)
+    local data = player_data(player)
+    local found
+    for entry, list in lists.each_entry(data) do
+      if entry.target and entry.type == panel.type and entry.name == panel.name and entry.surface == panel.surface then
+        if list == data.lists[data.active] then return entry.target end
+        found = found or entry.target
+      end
+    end
+    return found
+  end,
   PRECISIONS = PRECISIONS,
   ALL_SURFACES = ALL_SURFACES,
   EPSILON = EPSILON,
@@ -1584,6 +1684,19 @@ local flow_tab = require("scripts.flow")({
 })
 local step_rescan, update_flow_tab, show_next_machine, build_flow_tab =
   flow_tab.step_rescan, flow_tab.update_flow_tab, flow_tab.show_next_machine, flow_tab.build_flow_tab
+rootcause.init{find = flow_tab.root_causes, format_balance = format_balance}
+idle.init{
+  machines = machines,
+  format_balance = format_balance,
+  surface_caption = surface_caption,
+  balance = function(player, type, name, surface_name, precision_name)
+    if not prototype_of(type, name) then return nil end
+    local produced, consumed = flow_sum(sources(player.force, surface_name, type, name), name,
+                                        defines.flow_precision_index[precision_name])
+    return produced - consumed
+  end,
+}
+chain.init{player_data = player_data, lists = lists, candidates = flow_tab.chain_candidates, open_panel = function(player) set_open(player, true) end}
 
 local function axis_label(parent)
   local label = parent.add{type = "label", caption = ""}
@@ -1869,6 +1982,7 @@ local function check_watch(player)
   local data = player_data(player)
   local get_stats = stats_getter(player.force)
   local violated, fresh, changed = {}, {}, false
+  local active_log = {} -- id відкритих записів журналу, на які ще посилаються сторожі
   local all_paused = true
   for _, list in ipairs(data.lists) do
     if not list.watch_paused then all_paused = false end
@@ -1877,8 +1991,12 @@ local function check_watch(player)
     local watch = entry.watch
     if watch and list.watch_paused then
       -- список на паузі: не перевіряємо й гасимо індикатори; після паузи порушення сповістять знову
-      if watch.violated then changed = true end
-      watch.violated = nil
+      if watch.violated then
+        changed = true
+        marks.add_auto(player, entry, "pause", {since = watch.violated_since})
+        watchlog.close(player, watch.log_id, "pause")
+      end
+      watch.violated, watch.violated_since, watch.log_id = nil, nil, nil
     elseif watch and prototype_of(entry.type, entry.name) then
       local window = watch.window or DEFAULT_WATCH_WINDOW
       local produced, consumed = watch_average(player, entry, window, get_stats)
@@ -1900,11 +2018,24 @@ local function check_watch(player)
           reasons[#reasons + 1] = {"resbal.watch-alert-bal", format_balance(balance), format_balance(watch.min_balance)}
         end
         fresh[#fresh + 1] = {entry = entry, reasons = reasons, window = window}
+        watch.violated_since = game.tick
+        marks.add_auto(player, entry, "alert", {reasons = reasons})
+        watch.log_id = watchlog.open(player, entry, lists.caption(list), reasons, produced, balance)
+      elseif now then
+        watchlog.update(player, watch.log_id, produced, balance) -- порушення триває: мінімуми
+      elseif watch.violated then
+        -- кінець порушення: справжнє відновлення або лише відкладення (поріг досі порушено)
+        local how = (low_produced or low_balance) and "snooze" or "recover"
+        marks.add_auto(player, entry, how, {since = watch.violated_since})
+        watchlog.close(player, watch.log_id, how)
+        watch.violated_since, watch.log_id = nil, nil
       end
       watch.violated = now
       if now then violated[#violated + 1] = {entry = entry, list = list} end
     end
+    if watch and watch.log_id then active_log[watch.log_id] = true end
   end
+  watchlog.close_orphans(player, active_log)
 
   update_top_watch(player, violated, all_paused, #data.lists > 1)
   if #fresh > 0 then
@@ -1940,6 +2071,24 @@ marks.init{
     local unit, divisor = time_axis(seconds)
     return {"resbal.point-ago", {"resbal.t-" .. unit, short_number(seconds / divisor)}}
   end,
+  duration_caption = function(seconds) -- «14хв» для автопозначок сторожа
+    local unit, divisor = time_axis(seconds)
+    return {"resbal.t-" .. unit, short_number(seconds / divisor)}
+  end,
+}
+watchlog.init{
+  player_data = player_data,
+  format_number = format_number,
+  format_balance = format_balance,
+  where = entry_where,
+  ago_caption = function(seconds)
+    local unit, divisor = time_axis(seconds)
+    return {"resbal.point-ago", {"resbal.t-" .. unit, short_number(seconds / divisor)}}
+  end,
+  duration_caption = function(seconds)
+    local unit, divisor = time_axis(seconds)
+    return {"resbal.t-" .. unit, short_number(seconds / divisor)}
+  end,
 }
 
 script.on_nth_tick(WATCH_CHECK, function()
@@ -1955,6 +2104,8 @@ local function init_player(player)
 end
 
 script.on_init(function()
+  machines.rebuild()
+  fluidstock.rebuild()
   storage.players = {}
   for _, player in pairs(game.players) do
     init_player(player)
@@ -1979,6 +2130,8 @@ local function remove_legacy_gui(player)
 end
 
 script.on_configuration_changed(function()
+  machines.rebuild() -- набір машин міг змінитися (нові моди, міграції)
+  fluidstock.rebuild()
   storage.players = storage.players or {}
   storage.pending = {}
   if game.surfaces["rb-charts"] then game.delete_surface("rb-charts") end
@@ -1999,6 +2152,38 @@ script.on_configuration_changed(function()
     if state then state.tracker = nil end -- формат зведення по машинах міг змінитися
     if state and state.panels and #state.panels > 0 and (had_big or big_frame(player)) then build_big(player) end
   end
+end)
+
+-- Реєстр машин для фонового обліку станів: усі способи побудови (фільтр — лише машини з рецептами).
+-- Знесені не відстежуємо — вони випадають з реєстру під час опитування.
+for _, id in ipairs({defines.events.on_built_entity, defines.events.on_robot_built_entity,
+                     defines.events.on_space_platform_built_entity, defines.events.script_raised_built,
+                     defines.events.script_raised_revive, defines.events.on_entity_cloned}) do
+  local filter = {{filter = "type", type = fluidstock.TYPE}} -- резервуари (запас рідин) + машини з рецептами
+  for _, item in ipairs(machines.BUILT_FILTER) do filter[#filter + 1] = item end
+  script.on_event(id, function(event)
+    machines.on_built(event)
+    fluidstock.on_built(event)
+  end, filter)
+end
+
+-- Тимчасова команда заміру: скільки коштує опитування (для рішення про вкладку простою всієї фабрики)
+commands.add_command("resbal-perf", {"resbal.perf-help"}, function(command)
+  local player = command.player_index and game.get_player(command.player_index)
+  local profiler = helpers.create_profiler()
+  local done = machines.step(game.tick, 1000)
+  profiler.stop()
+  local interval = tonumber(settings.global["resbal-history-interval"].value)
+  local per_tick = interval and math.ceil(machines.count() / (interval * 60)) or 0
+  local message = {"resbal.perf-result", machines.count(), done, profiler, per_tick}
+  if player then player.print(message) else game.print(message) end
+  -- резервуари: один перерахунок поверхні гравця (так раз на 10 с, поки відкрита панель)
+  local surface = player and player.surface or game.surfaces[1]
+  local tanks = helpers.create_profiler()
+  fluidstock.recompute(surface.index)
+  tanks.stop()
+  local tanks_message = {"resbal.perf-tanks", fluidstock.count(), tanks}
+  if player then player.print(tanks_message) else game.print(tanks_message) end
 end)
 
 script.on_event(defines.events.on_force_created, function(event)
@@ -2046,11 +2231,76 @@ script.on_event("resbal-toggle", function(event)
   toggle(game.get_player(event.player_index))
 end)
 
+-- Клавіша «додати під курсором»: що саме додати за прототипом під курсором (тип, назва) або nil
+local HOVER_CRAFTERS = {["assembling-machine"] = true, furnace = true, ["rocket-silo"] = true}
+
+local function recipe_product(recipe)
+  if not recipe then return nil end
+  local product = recipe.main_product or (#recipe.products == 1 and recipe.products[1]) or recipe.products[1]
+  if product and (product.type == "item" or product.type == "fluid") then return product.type, product.name end
+  return nil
+end
+
+local function hovered_resource(player, selected)
+  local base, name = selected.base_type, selected.name
+  if base == "item" or base == "fluid" then return base, name end
+  if base == "recipe" then return recipe_product(prototypes.recipe[name]) end
+  if base ~= "entity" then return nil end
+  local entity = player.selected
+  if entity and entity.valid and entity.name == name then
+    local ore = entity.type == "resource" and entity -- родовище: те, що з нього видобувається
+    if entity.type == "mining-drill" then ore = entity.mining_target end -- бур (і качалка): його поточне родовище
+    if ore and ore.valid then
+      local products = ore.prototype.mineable_properties.products
+      if products and products[1] then return products[1].type, products[1].name end
+    elseif entity.type == "offshore-pump" then -- насос на воді: рідина під ним
+      local fluid = entity.get_fluid_source_fluid()
+      if fluid then return "fluid", fluid end
+    elseif HOVER_CRAFTERS[entity.type] then -- машина: продукт її рецепта (піч без входу — попередній)
+      -- get_recipe() повертає LuaRecipe (рецепт сили, без main_product) — беремо прототип за назвою
+      local current = entity.get_recipe()
+      local recipe = current and prototypes.recipe[current.name]
+      if not recipe and entity.type == "furnace" and entity.previous_recipe then
+        local previous = entity.previous_recipe.name
+        recipe = prototypes.recipe[type(previous) == "string" and previous or (previous and previous.name)]
+      end
+      local product_type, product_name = recipe_product(recipe)
+      if product_type then return product_type, product_name end
+    end
+  end
+  -- інша будівля (скриня, конвеєр, порожня машина) — нічого: саму будівлю додають, навівши на її предмет
+  return nil
+end
+
+script.on_event("resbal-add-hovered", function(event)
+  local player = game.get_player(event.player_index)
+  local selected = event.selected_prototype
+  local type, name = nil, nil
+  if selected then type, name = hovered_resource(player, selected) end
+  if not (type and prototype_of(type, name)) then
+    player.create_local_flying_text{text = {"resbal.hover-nothing"}, create_at_cursor = true}
+    return
+  end
+  local data = player_data(player)
+  local surface_name = data.add_all and ALL_SURFACES or player.surface.name
+  local icon = "[" .. type .. "=" .. name .. "]"
+  for _, entry in ipairs(data.entries) do
+    if entry.type == type and entry.name == name and entry.surface == surface_name then
+      player.create_local_flying_text{text = {"resbal.hover-exists", icon}, create_at_cursor = true}
+      return
+    end
+  end
+  add_entry(player, type, name, surface_name)
+  player.create_local_flying_text{text = {"resbal.hover-added", icon, lists.caption(data.lists[data.active])},
+                                  create_at_cursor = true}
+  if main_frame(player) then build(player) end
+end)
+
 script.on_event(defines.events.on_lua_shortcut, function(event)
   if event.prototype_name == "resbal-toggle" then toggle(game.get_player(event.player_index)) end
 end)
 
-script.on_event(defines.events.on_gui_click, function(event)
+local function handle_click(event)
   local element = event.element
   if not (element and element.valid) then return end
   local player = game.get_player(event.player_index)
@@ -2059,6 +2309,10 @@ script.on_event(defines.events.on_gui_click, function(event)
 
   if lists.on_click(player, element) then return end
   if marks.on_click(player, element) then return end
+  if watchlog.on_click(player, element) then return end
+  if chain.on_click(player, element) then return end
+  if rootcause.on_click(player, element) then return end
+  if idle.on_click(player, element) then return end
 
   local watch_entry = element.tags and element.tags.resbal_watch
   if watch_entry then
@@ -2154,29 +2408,52 @@ script.on_event(defines.events.on_gui_click, function(event)
     if tags.resbal_action == "del" then
       table.remove(data.entries, tags.entry)
       build(player)
+      if check_watch_now then check_watch_now(player) end -- закрити запис журналу, якщо ресурс був у порушенні
     elseif tags.resbal_action == "pin" then
       add_entry(player, tags.type, tags.name, tags.surface)
       player.create_local_flying_text{text = {"resbal.pinned"}, create_at_cursor = true}
     end
   end
-end)
+end
 
--- Esc / E / відкриття іншого вікна гри
-script.on_event(defines.events.on_gui_confirmed, function(event)
+-- Після кліку чи Enter діалог міг відкритися або закритися — тоді оновлюємо, що закривається на Esc.
+-- Лише за зміни діалогу: інакше клік у чужому вікні (інвентар) перемикав би player.opened.
+local function with_dialog_check(handler)
+  return function(event)
+    local player = game.get_player(event.player_index)
+    local before = player and top_dialog(player)
+    handler(event)
+    if player and player.valid and top_dialog(player) ~= before then update_opened(player) end
+  end
+end
+
+script.on_event(defines.events.on_gui_click, with_dialog_check(handle_click))
+
+local function handle_confirmed(event)
   local element = event.element
   if element and element.valid and lists.on_confirmed(game.get_player(event.player_index), element) then return end
   if element and element.valid and marks.on_confirmed(game.get_player(event.player_index), element) then return end
-  if element and element.valid and (element.name == "resbal_watch_prod" or element.name == "resbal_watch_bal") then
+  if element and element.valid and chain.on_confirmed(game.get_player(event.player_index), element) then return end
+  if element and element.valid and (element.name == "resbal_watch_prod" or element.name == "resbal_watch_bal"
+                                    or element.name == "resbal_watch_target") then
     save_watch(game.get_player(event.player_index))
   end
-end)
+end
+
+script.on_event(defines.events.on_gui_confirmed, with_dialog_check(handle_confirmed))
+
+-- Esc / E / відкриття іншого вікна гри
 
 script.on_event(defines.events.on_gui_closed, function(event)
   if quiet[event.player_index] then return end
   local element = event.element
   if not (element and element.valid) then return end
   local player = game.get_player(event.player_index)
-  if element == big_frame(player) then
+  if DIALOG_NAMES[element.name] then
+    -- Esc у діалозі: закрити лише його, «відкритим» знову стає графік або панель
+    destroy_quietly(player, element)
+    update_opened(player)
+  elseif element == big_frame(player) then
     close_big(player)
   elseif element == main_frame(player) then
     set_open(player, false)
@@ -2246,6 +2523,10 @@ end)
 -- Оновлення за розкладом обраного проміжку; графіки після кожного оновлення
 -- перераховуються по черзі (кілька за тік), щоб не було ривків
 script.on_event(defines.events.on_tick, function(event)
+  machines.step(event.tick) -- фоновий облік станів машин (порція на тік)
+  fluidstock.step() -- фоновий перерахунок запасу рідин (порція на тік, лише коли кеш застарів)
+  if event.tick % 18000 == 0 then machines.cleanup(event.tick) end -- раз на 5 хв: старі кошики
+  if event.tick % 600 == 0 then idle.refresh() end -- відкриті вікна «Простої фабрики» — раз на 10 с
   for _, player in pairs(game.connected_players) do
     local frame = main_frame(player)
     if frame then

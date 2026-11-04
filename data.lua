@@ -10,6 +10,15 @@ data:extend({
     consuming = "none",
     order = "a",
   },
+  -- додати в поточний список те, що під курсором: предмет, рідину, рецепт або машину (її продукт)
+  {
+    type = "custom-input",
+    name = "resbal-add-hovered",
+    key_sequence = "ALT + R",
+    consuming = "none",
+    include_selected_prototype = true,
+    order = "b",
+  },
   {
     type = "shortcut",
     name = "resbal-toggle",
