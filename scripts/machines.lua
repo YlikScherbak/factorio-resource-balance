@@ -250,4 +250,20 @@ function M.count()
   return #state().list
 end
 
+-- Машини з рецептами на поверхні сили — з реєстру (замість find_entities_filtered: на 20 тис. машин пошук
+-- за один тік давав помітний ривок при відкритті «Виробників і споживачів»). Лише дійсні.
+function M.entities_on(surface_index, force_index)
+  local s = state()
+  if not s.built then M.rebuild() end
+  local result = {}
+  for _, record in ipairs(s.list) do
+    local entity = record.entity
+    if entity.valid then
+      if not record.force then record.force, record.surface = entity.force.index, entity.surface.index end
+      if record.surface == surface_index and record.force == force_index then result[#result + 1] = entity end
+    end
+  end
+  return result
+end
+
 return M

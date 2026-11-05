@@ -1,4 +1,38 @@
 ---------------------------------------------------------------------------------------------------
+Version: 1.7.0
+Date: 2026-11-05
+  Features:
+    - Redesigned interface. The panel has flat rows with separators and short column headers; the last row is
+      "+ Add resource" with a compact Σ toggle (count a new resource on all planets). Search moved to the title
+      bar next to the help button.
+    - Resource window with tabs: Chart, Producers & consumers, Root causes, Watcher. The title shows "+N" when
+      resources are compared; the trash button removes the resource from the open list.
+    - Producers & consumers starts with a diagnosis card: balance, producer history bars, output target verdict,
+      possible cause, full storage and delivery hints in one place. Recipe shares are shown as bars.
+    - Root causes ("Dig deeper") is a tab of the resource window now.
+    - Watcher tab: the state with snooze and remove, thresholds with the current value next to each, the averaging
+      window and the alert log of this resource. For a resource that is not in a list it offers to add it.
+    - "Deficit" tab before the lists (replaces the "Negative only" mode): the 50 largest deficits on the planet,
+      search finds the rest. "+" on a row opens an "Add to" window to choose the list.
+    - One list dialog: "+" creates a list (optionally from an export string), the pencil edits the current one —
+      name with an icon, export string, delete.
+    - Chart marks are a collapsible panel in the chart tab ("Marks (N)"); it lists your marks and the watcher marks
+      of the resources on this chart.
+    - "Diagnostics" window: the factory idle view and the watcher log as two tabs. Idle has a bar of lost machine
+      time per recipe.
+  Changes:
+    - The hotkey for adding what is under the cursor is Ctrl+Alt+R now (Alt+R conflicted with the NVIDIA overlay).
+    - Recipe share is capped at 100% (an estimate above it is explained in the tooltip).
+    - Empty states (no log yet, history still collecting) are shown as a centred message.
+  Optimisations:
+    - Much less GUI work per update: quality lookups are cached, mini-charts reuse their line segments, the
+      Deficit tab draws at most 50 rows and recounts its number once a minute.
+    - Producers & consumers takes machines from the background registry instead of searching the whole planet —
+      no hitch when the tab opens on a large base.
+  Bugfixes:
+    - Multiplayer: the state of open windows is kept in the save, which could otherwise cause a desync.
+    - English texts showed backslashes before quotes.
+---------------------------------------------------------------------------------------------------
 Version: 1.6.0
 Date: 2026-11-05
   Features:

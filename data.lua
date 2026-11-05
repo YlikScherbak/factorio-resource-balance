@@ -14,7 +14,7 @@ data:extend({
   {
     type = "custom-input",
     name = "resbal-add-hovered",
-    key_sequence = "ALT + R",
+    key_sequence = "CONTROL + ALT + R",
     consuming = "none",
     include_selected_prototype = true,
     order = "b",
@@ -84,3 +84,37 @@ styles.resbal_column_button = {
   hovered_graphical_set = highlight,
   clicked_graphical_set = highlight,
 }
+
+-- ---------- Редизайн 1.7: власні стилі (префікс resbal_, не rb_ — rb колись конфліктував з Recipe Book) ----------
+-- Колір несе значок стану, а не текст; червоне — лише деструктивні дії й тривоги.
+local red = styles.red_button
+
+-- Вузька кнопка проміжку / вікна усереднення
+styles.resbal_period_button = {
+  type = "button_style", parent = "button",
+  minimal_width = 36, height = 28, left_padding = 6, right_padding = 6,
+}
+-- Чип ресурсу (порівняння, причини) і лічильник стану машин — видно, що це кнопки
+styles.resbal_chip = {
+  type = "button_style", parent = "button",
+  height = 24, minimal_width = 0, left_padding = 4, right_padding = 6, font = "default-small",
+}
+styles.resbal_state_chip = {type = "button_style", parent = "resbal_chip", height = 20, left_padding = 2, right_padding = 4}
+-- Дія в рядку таблиці: темна пласка кнопка (як кнопки в заголовку вікна)
+styles.resbal_row_icon = {
+  type = "button_style", parent = "frame_action_button", size = 28,
+  invert_colors_of_picture_when_hovered_or_toggled = false,
+}
+-- «Видалити» в рядку: сіра, червоніє лише при наведенні
+styles.resbal_row_remove = {
+  type = "button_style", parent = "frame_action_button", size = 28,
+  invert_colors_of_picture_when_hovered_or_toggled = false,
+  hovered_graphical_set = red.hovered_graphical_set,
+  clicked_graphical_set = red.clicked_graphical_set,
+}
+-- Службовий сірий текст — єдиний «сірий» у моді
+styles.resbal_quiet_label = {type = "label_style", parent = "label", font_color = {0.7, 0.7, 0.7}}
+-- Рядок причини / висновку: звичайний колір, перенос
+styles.resbal_cause_label = {type = "label_style", parent = "label", single_line = false, maximal_width = 740}
+-- Смужка частки
+styles.resbal_share_bar = {type = "progressbar_style", parent = "progressbar", width = 80}

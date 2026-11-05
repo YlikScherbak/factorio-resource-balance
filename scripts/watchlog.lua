@@ -38,15 +38,16 @@ local function prune(log)
   end
 end
 
-local function dialog(player)
-  return player.gui.screen.resbal_watchlog
+-- Вміст вкладки «Журнал сторожа» вікна «Діагностика фабрики» (редизайн 1.7), якщо вона відкрита
+local function container(player)
+  return ctx.diag_inner(player, "log")
 end
 
 local fill -- оголошено нижче
 
 local function refresh(player, data)
-  local frame = dialog(player)
-  if frame then fill(frame, data) end
+  local inner = container(player)
+  if inner then fill(inner, data) end
 end
 
 -- Нове порушення; повертає id запису (зберігається в entry.watch.log_id)
@@ -79,6 +80,20 @@ function M.close(player, id, how)
   refresh(player, data)
 end
 
+-- Записи одного ресурсу (для вкладки «Сторож»), новіші першими, не більше limit
+function M.records_for(player, resource, limit)
+  local result = {}
+  local log = log_of(ctx.player_data(player))
+  for i = #log, 1, -1 do
+    local record = log[i]
+    if record.type == resource.type and record.name == resource.name and record.surface == resource.surface then
+      result[#result + 1] = record
+      if #result >= limit then break end
+    end
+  end
+  return result
+end
+
 -- Відкриті записи, на які вже не посилається жоден сторож (ресурс чи вкладку видалили), закриваються
 -- як «прибрано». active — {[log_id] = true} з усіх списків гравця.
 function M.close_orphans(player, active)
@@ -93,31 +108,42 @@ function M.close_orphans(player, active)
   if closed then refresh(player, data) end
 end
 
-local function close_dialog(player)
-  local frame = dialog(player)
-  if frame then frame.destroy() end
-end
-
 local COLUMNS = 7
 
-function fill(frame, data)
-  local tbl = frame.inner.scroll.resbal_watchlog_table
+-- Порожній стан (один вигляд у всьому моді): сірий напис по центру замість порожньої таблиці
+local function empty_state(parent, name)
+  local box = parent.add{type = "flow", name = name, direction = "vertical"}
+  box.style.horizontal_align = "center"
+  box.style.horizontally_stretchable = true
+  box.style.top_padding, box.style.bottom_padding = 24, 24
+  box.add{type = "label", name = "resbal_empty_text", caption = "", style = "resbal_quiet_label"}
+  box.visible = false
+  return box
+end
+
+function fill(inner, data)
+  local tbl = inner.resbal_log_scroll.resbal_watchlog_table
   tbl.clear()
   for _, caption in ipairs({"watchlog-col-start", "watchlog-col-resource", "watchlog-col-where", "watchlog-col-duration",
                             "watchlog-col-produced", "watchlog-col-balance", "watchlog-col-end"}) do
-    tbl.add{type = "label", caption = {"resbal." .. caption}, style = "bold_label"}
+    tbl.add{type = "label", caption = {"resbal." .. caption}, style = "resbal_quiet_label"}
   end
   local log = log_of(data)
+  local ongoing = 0
+  for _, record in ipairs(log) do
+    if not record.finish then ongoing = ongoing + 1 end
+  end
+  inner.resbal_log_head.resbal_log_counts.caption = {"resbal.watchlog-counts", #log, ongoing}
+  local empty = inner.resbal_log_empty
+  tbl.visible = #log > 0
+  empty.visible = #log == 0
   if #log == 0 then
-    local empty = tbl.add{type = "label", caption = {"resbal.watchlog-empty"}}
-    empty.style.font_color = {0.7, 0.7, 0.7}
-    for _ = 2, COLUMNS do tbl.add{type = "empty-widget"} end
+    empty.resbal_empty_text.caption = {"resbal.watchlog-empty"}
     return
   end
   for i = #log, 1, -1 do -- новіші зверху
     local record = log[i]
-    local start = tbl.add{type = "label", caption = ctx.ago_caption((game.tick - record.start) / 60)}
-    start.style.font_color = {0.7, 0.7, 0.7}
+    tbl.add{type = "label", caption = ctx.ago_caption((game.tick - record.start) / 60), style = "resbal_quiet_label"}
     local proto = (record.type == "fluid" and prototypes.fluid or prototypes.item)[record.name]
     local icon = "[" .. record.type .. "=" .. record.name .. "] "
     local resource = tbl.add{type = "button", style = "resbal_status_button",
@@ -143,61 +169,39 @@ function fill(frame, data)
   end
 end
 
-local function open_dialog(player)
-  close_dialog(player)
-  local frame = player.gui.screen.add{type = "frame", name = "resbal_watchlog", direction = "vertical"}
-  frame.auto_center = true
-  local titlebar = frame.add{type = "flow", direction = "horizontal"}
-  titlebar.drag_target = frame
-  titlebar.add{type = "label", style = "frame_title", caption = {"resbal.watchlog-title"}, ignored_by_interaction = true}
-  local drag = titlebar.add{type = "empty-widget", style = "draggable_space_header", ignored_by_interaction = true}
-  drag.style.height = 24
-  drag.style.horizontally_stretchable = true
-  drag.style.minimal_width = 24
-  drag.style.right_margin = 4
-  titlebar.add{type = "sprite-button", name = "resbal_watchlog_clear", sprite = "utility/trash", style = "frame_action_button",
-               tooltip = {"resbal.watchlog-clear"}}
-  titlebar.add{type = "sprite-button", name = "resbal_watchlog_close", sprite = "utility/close",
-               style = "frame_action_button", tooltip = {"resbal.close"}}
-
-  local inner = frame.add{type = "frame", name = "inner", direction = "vertical", style = "inside_shallow_frame_with_padding"}
-  local hint = inner.add{type = "label", caption = {"resbal.watchlog-hint", MAX_RECORDS}}
-  hint.style.single_line = false
-  hint.style.maximal_width = 760
-  hint.style.font_color = {0.7, 0.7, 0.7}
-  local scroll = inner.add{type = "scroll-pane", name = "scroll"}
-  scroll.style.maximal_height = 420
-  scroll.style.top_margin = 8
+-- Вкладка «Журнал сторожа»: лічильники, пояснення в підказці (i), «Очистити» — тут, подалі від ✕ вікна
+function M.build_into(inner, player)
+  local head = inner.add{type = "flow", name = "resbal_log_head", direction = "horizontal"}
+  head.style.vertical_align = "center"
+  head.style.horizontal_spacing = 8
+  head.add{type = "label", name = "resbal_log_counts", caption = "", style = "resbal_quiet_label"}
+  head.add{type = "empty-widget"}.style.horizontally_stretchable = true
+  local tip = head.add{type = "sprite", sprite = "utility/tip_icon", tooltip = {"resbal.watchlog-hint", MAX_RECORDS}}
+  tip.style.size = 16
+  tip.style.stretch_image_to_widget_size = true
+  head.add{type = "sprite-button", name = "resbal_watchlog_clear", sprite = "utility/trash", style = "tool_button_red",
+           tooltip = {"resbal.watchlog-clear"}}
+  empty_state(inner, "resbal_log_empty")
+  local scroll = inner.add{type = "scroll-pane", name = "resbal_log_scroll"}
+  scroll.style.maximal_height = 520
+  scroll.style.minimal_width = 820
+  scroll.style.top_margin = 6
   local tbl = scroll.add{type = "table", name = "resbal_watchlog_table", column_count = COLUMNS,
                          draw_horizontal_line_after_headers = true}
   tbl.style.horizontal_spacing = 14
   tbl.style.vertical_spacing = 4
-  fill(frame, ctx.player_data(player))
-end
-
-function M.add_button(parent)
-  local button = parent.add{type = "button", name = "resbal_watchlog_open", caption = {"resbal.watchlog"},
-                            tooltip = {"resbal.watchlog-tooltip"}}
-  button.style.left_margin = 4
+  fill(inner, ctx.player_data(player))
 end
 
 function M.on_click(player, element)
-  local name = element.name
-  if name == "resbal_watchlog_open" then
-    if dialog(player) then close_dialog(player) else open_dialog(player) end
-  elseif name == "resbal_watchlog_close" then
-    close_dialog(player)
-  elseif name == "resbal_watchlog_clear" then
-    -- очищаємо завершені; відкриті порушення лишаються (на них посилається сторож)
-    local data = ctx.player_data(player)
-    local log = log_of(data)
-    for i = #log, 1, -1 do
-      if log[i].finish then table.remove(log, i) end
-    end
-    refresh(player, data)
-  else
-    return false
+  if element.name ~= "resbal_watchlog_clear" then return false end
+  -- очищаємо завершені; відкриті порушення лишаються (на них посилається сторож)
+  local data = ctx.player_data(player)
+  local log = log_of(data)
+  for i = #log, 1, -1 do
+    if log[i].finish then table.remove(log, i) end
   end
+  refresh(player, data)
   return true
 end
 

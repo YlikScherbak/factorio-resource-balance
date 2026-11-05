@@ -21,7 +21,7 @@ return function(ctx)
   local TRACK_REORDER = 10     -- опитувань «наживо» між пересортуваннями рядків
   local TOP_RECIPES = 15
 
-  local SCAN_BATCH = 3000      -- машин за тік при перепошуку (щоб не було ривка)
+  local SCAN_BATCH = 1000      -- машин за тік при перепошуку (на 20 тис. машин — ≈20 легких тіків замість 7 важких)
 
   -- Стан машин — знімок під час перепошуку (раз на TRACK_RESCAN), між перепошуками не змінюється.
   -- Групи: працює / нема входу / вихід повний / енергія чи паливо / інше. Частини станів немає в 2.0 — пропускаємо.
@@ -38,6 +38,9 @@ return function(ctx)
   -- Історія станів (фоновий облік): вікно за проміжком вкладки, хв (історія тримається 30 хв)
   local HISTORY_MINUTES = {one_minute = 5, ten_minutes = 10, one_hour = 30, ten_hours = 30}
   local HISTORY_ORDER = {"working", "no_input", "full_output", "power", "other"}
+  -- колір смужки історії — як значок стану
+  local HISTORY_COLORS = {working = {0.35, 0.85, 0.35}, no_input = {1, 0.85, 0.1}, full_output = {0.3, 0.6, 1},
+                          power = {1, 0.3, 0.25}, other = {0.6, 0.6, 0.6}}
 
   -- «працювали 54% · без входу 31% · …» (групи від 1%)
   local function history_parts(shares)
@@ -243,7 +246,7 @@ return function(ctx)
     tracker.next_rescan = game.tick + (interval and interval * 60 or TRACK_RESCAN)
     local chunks, total = {}, 0
     for _, surface in ipairs(surfaces_of(tracker.panel.surface)) do
-      local entities = surface.find_entities_filtered{type = CRAFTING_TYPES, force = player.force}
+      local entities = machines.entities_on(surface.index, player.force.index) -- з реєстру, без пошуку по карті
       chunks[#chunks + 1] = {index = surface.index, entities = entities}
       total = total + #entities
     end
@@ -477,7 +480,7 @@ return function(ctx)
     local item_stats = statistics(player.force, surface, "item")
     local fluid_stats = statistics(player.force, surface, "fluid")
     local function made(type, name) -- вироблено за хвилину (середнє за проміжок)
-      return (flow(type == "fluid" and fluid_stats or item_stats, name, precision, nil, type))
+      return (flow(type == "fluid" and fluid_stats or item_stats, name, precision, nil, type, surface.index))
     end
     local total_produced = made(panel.type, panel.name)
     -- частка рецепта у виробництві продукту на цій планеті (за потужністю машин × вихід × продуктивність)
@@ -539,7 +542,8 @@ return function(ctx)
   local function flow_section(parent, name, caption)
     local header = parent.add{type = "label", caption = caption, style = "bold_label"}
     header.style.top_margin = 8
-    local tbl = parent.add{type = "table", name = name, column_count = 7, draw_horizontal_lines = true}
+    local tbl = parent.add{type = "table", name = name, column_count = 7, draw_horizontal_lines = true,
+                           draw_horizontal_line_after_headers = true}
     tbl.style.horizontal_spacing = 12
     tbl.style.vertical_spacing = 4
     return tbl
@@ -595,7 +599,7 @@ return function(ctx)
     name.style.maximal_width = 260 -- довгі назви рецептів (Py) не розширюють вікно
     if muted then name.style.font_color = {0.7, 0.7, 0.7} end
     local count = tbl.add{type = "label", caption = machines or "", tooltip = machines_tooltip}
-    count.style.minimal_width = 50
+    count.style.minimal_width = 72 -- щоб заголовок «Машины» (ru) не обрізався
     count.style.horizontal_align = "right"
     local status = tbl.add{type = "flow", direction = "horizontal"}
     status.style.minimal_width = 150
@@ -604,7 +608,9 @@ return function(ctx)
     local value = tbl.add{type = "label", caption = rate, tooltip = rate_tooltip}
     value.style.minimal_width = 80
     value.style.horizontal_align = "right"
-    local percent = tbl.add{type = "label", caption = string.format("%.0f%%", share * 100)}
+    -- частка не більше 100%: у режимі статистики витрата рецепта — оцінка (≈) і може перевищити загальну
+    local percent = tbl.add{type = "label", caption = string.format("%.0f%%", math.min(share, 1) * 100),
+                            tooltip = share > 1.005 and {"resbal.share-capped", string.format("%.0f", share * 100)} or nil}
     percent.style.minimal_width = 40
     percent.style.horizontal_align = "right"
     local bar = tbl.add{type = "progressbar", value = math.max(0, math.min(1, share))}
@@ -613,8 +619,28 @@ return function(ctx)
   end
 
   -- Рядки секції: компоненти окремо, будівлі/обладнання — одним рядком, «Інше» — останнім
+  -- Заголовки колонок таблиці рецептів (таблиця перебудовується при кожному оновленні — додаються знову)
+  local FLOW_COLUMNS = {{""}, {"flow-col-recipe"}, {"flow-col-machines", "right"}, {"flow-col-state"},
+                        {"flow-col-rate", "right"}, {"flow-col-share", "right"}, {""}}
+
+  local function flow_headers(tbl)
+    for _, column in ipairs(FLOW_COLUMNS) do
+      if column[1] == "" then
+        tbl.add{type = "empty-widget"}
+      else
+        local label = tbl.add{type = "label", caption = {"resbal." .. column[1]}, style = "resbal_quiet_label",
+                              tooltip = {"resbal." .. column[1] .. "-tooltip"}}
+        if column[2] then
+          label.style.horizontal_align = column[2]
+          label.style.horizontally_stretchable = true
+        end
+      end
+    end
+  end
+
   local function fill_flow_section(tbl, tracker, order, rates, approx, total, other_key, section, cursors, hist)
     tbl.clear()
+    flow_headers(tbl)
     local shown, rest, rest_count = 0, 0, 0
     local buildings, building_names = 0, {}
     local building_total, building_working = 0, 0
@@ -709,11 +735,12 @@ return function(ctx)
     end
     local head = {"resbal.target-head", format_number(target), format_number(produced),
                   string.format("%.0f", produced / target * 100)}
-    local verdict, color
+    -- колір несе значок (як у стані машин), текст — звичайний
+    local verdict, icon
     if produced >= target * TARGET_REACHED then
       verdict = capacity > 0 and {"resbal.target-reached", string.format("%.0f", math.max(0, capacity / target - 1) * 100)}
                 or {"resbal.target-reached-plain"}
-      color = {0.45, 0.9, 0.45}
+      icon = STATUS_SPRITES.working
     elseif capacity < target * 0.98 then
       if main and main_per_machine > 0 then
         local proto = prototypes.recipe[main.name]
@@ -722,17 +749,16 @@ return function(ctx)
       else
         verdict = {"resbal.target-no-machines"}
       end
-      color = {1, 0.6, 0.3}
+      icon = "utility/warning_icon"
     else
       local reason, most = "other", 0
       for _, group in ipairs(IDLE_REASONS) do
         if (groups[group] or 0) > most then reason, most = group, groups[group] end
       end
       verdict = {"resbal.target-idle-" .. reason, format_number(capacity)}
-      color = {1, 0.85, 0.3}
+      icon = STATUS_SPRITES[reason]
     end
-    label.caption = {"", head, " ", verdict}
-    label.style.font_color = color
+    label.caption = {"", "[img=" .. icon .. "] ", head, " ", verdict}
     label.visible = true
   end
 
@@ -776,7 +802,8 @@ return function(ctx)
     if #found == 0 then return end
     table.sort(found, function(a, b) return a.balance < b.balance end)
     flow.visible = true
-    flow.add{type = "label", caption = {"resbal.cause"}, tooltip = {"resbal.cause-tooltip", CAUSE_RECIPES}}
+    flow.add{type = "label", caption = {"", "[img=" .. STATUS_SPRITES.no_input .. "] ", {"resbal.cause"}},
+             tooltip = {"resbal.cause-tooltip", CAUSE_RECIPES}}
     for i = 1, math.min(CAUSE_MAX, #found) do
       local item = found[i]
       local button = flow.add{type = "button", style = "resbal_status_button",
@@ -908,14 +935,16 @@ return function(ctx)
     use_number_format(player)
     local state, frame = big_state(player), big_frame(player)
     if not (state and frame and state.tab == "flow" and state.tracker) then return end
-    local content = frame.resbal_big_inner.resbal_flow
-    if not content then return end
+    local tabs = frame.resbal_big_tabs
+    local content = tabs and tabs.resbal_big_inner and tabs.resbal_big_inner.resbal_flow
+    local card = content and content.resbal_flow_card
+    if not card then return end -- вкладку побудовано до оновлення мода
     local tracker = state.tracker
     local live = state.flow_mode == "live"
     if not tracker.scan and (game.tick >= tracker.next_rescan or not tracker.by_surface) then start_rescan(tracker, player) end
     if not tracker.recipes then
       -- перший прохід перепошуку ще триває (порціями по тіках) — показуємо прогрес
-      content.resbal_flow_status.caption = {"resbal.flow-scanning", scan_progress(tracker)}
+      card.resbal_card_head.resbal_card_title.caption = {"resbal.flow-scanning", scan_progress(tracker)}
       state.flow_next = game.tick + 1
       return
     end
@@ -940,34 +969,53 @@ return function(ctx)
     local short = deficit_state(tracker, total_consumed, balance)
     -- буфер повний, споживачі працюють — не дефіцит: замість причин і «перевір доставку» — нейтральний рядок
     local buffered = short and buffer_state(tracker, produced_rates, consumed_rates)
-    if content.resbal_flow_buffer then content.resbal_flow_buffer.visible = buffered == true end
-    fill_cause(content.resbal_flow_cause, player, panel, precision_index, produced_rates, short and not buffered)
-    fill_delivery(content.resbal_flow_delivery, tracker, panel, produced_rates, short and not buffered)
-    fill_target(content.resbal_flow_target, player, tracker, total_produced)
-    content.resbal_flow_header.caption = {"resbal.flow-header", rich_icon(panel), format_number(total_produced),
-                                          format_number(total_consumed),
-                                          (balance > EPSILON and "+" or "") .. format_number(balance),
-                                          {"resbal.p-" .. PRECISIONS[precision_index]}}
+    card.resbal_flow_buffer.visible = buffered == true
+    fill_cause(card.resbal_flow_cause, player, panel, precision_index, produced_rates, short and not buffered)
+    fill_delivery(card.resbal_flow_delivery, tracker, panel, produced_rates, short and not buffered)
+    fill_target(card.resbal_flow_target, player, tracker, total_produced)
+    -- дефіцит без жодної знайденої причини — окремий рядок, щоб картка не була порожньою
+    card.resbal_flow_none.visible = short and not buffered and not card.resbal_flow_cause.visible
+                                    and not card.resbal_flow_delivery.visible
+
+    -- заголовок картки, числа (баланс першим і кольором), службове — у підказці значка (i)
+    local period = live and {"resbal.card-live"} or {"resbal.p-" .. PRECISIONS[precision_index]}
+    card.resbal_card_head.resbal_card_title.caption = {"resbal.card-title", rich_icon(panel), period}
+    local balance_color = balance > EPSILON and "0.4,1,0.4" or balance < -EPSILON and "1,0.45,0.4" or "0.8,0.8,0.8"
+    card.resbal_flow_header.caption = {"resbal.card-numbers",
+                                       "[color=" .. balance_color .. "]" .. (balance > EPSILON and "+" or "")
+                                         .. format_number(balance) .. "[/color]",
+                                       format_number(total_produced), format_number(total_consumed)}
     if live then
       local elapsed = math.min(tracker.polls, TRACK_WINDOW)
-      content.resbal_flow_status.caption = {"", elapsed < 5 and {"resbal.flow-collecting", elapsed}
-                                                or {"resbal.flow-measured", elapsed}, status_age(tracker)}
+      card.resbal_card_head.resbal_flow_status.tooltip = {"", elapsed < 5 and {"resbal.flow-collecting", elapsed}
+                                                              or {"resbal.flow-measured", elapsed}, status_age(tracker)}
     else
-      content.resbal_flow_status.caption = {"", {"resbal.flow-estimated", {"resbal.p-" .. PRECISIONS[precision_index]}},
-                                            status_age(tracker)}
+      card.resbal_card_head.resbal_flow_status.tooltip = {"", {"resbal.flow-estimated",
+                                                               {"resbal.p-" .. PRECISIONS[precision_index]}},
+                                                          status_age(tracker)}
     end
 
-    -- історія станів виробників (фоновий облік): на що пішов час за останні N хвилин
+    -- історія станів виробників (фоновий облік) смужками: на що пішов час за останні N хвилин
     local hist = history_context(player, panel, live and "one_minute" or PRECISIONS[precision_index])
-    local history_label = content.resbal_flow_history
-    if history_label then -- вкладку побудовано до оновлення мода — рядка немає
-      local shares, covered = history_of(hist, produced_rates)
-      if not machines.enabled() then
-        history_label.caption = {"resbal.history-off"}
-      elseif not shares then
-        history_label.caption = {"resbal.history-collecting"}
-      else
-        history_label.caption = {"resbal.history-line", math.min(covered, hist.minutes), history_parts(shares)}
+    local history = card.resbal_flow_history
+    history.clear()
+    local shares, covered = history_of(hist, produced_rates)
+    if not machines.enabled() then
+      history.add{type = "label", caption = {"resbal.history-off"}, style = "resbal_quiet_label"}
+    elseif not shares then
+      history.add{type = "label", caption = {"resbal.history-collecting"}, style = "resbal_quiet_label"}
+    else
+      history.add{type = "label", caption = {"resbal.history-head", math.min(covered, hist.minutes)}}
+      local shown = 0
+      for _, group in ipairs(HISTORY_ORDER) do
+        local share = shares[group]
+        if share and share >= 0.01 and shown < 3 then
+          shown = shown + 1
+          history.add{type = "label", caption = {"resbal.history-" .. group, string.format("%.0f", share * 100)}}
+          local bar = history.add{type = "progressbar", value = share}
+          bar.style.width = 90
+          bar.style.color = HISTORY_COLORS[group]
+        end
       end
     end
 
@@ -1104,6 +1152,10 @@ return function(ctx)
     local live = modes.add{type = "button", name = "resbal_flive", caption = {"resbal.flow-live"},
                            tooltip = {"resbal.flow-tooltip"}}
     live.toggled = state.flow_mode == "live"
+    -- «Створити список з інгредієнтів» — у рядку проміжків праворуч (а не окремим рядком у тілі вкладки)
+    modes.add{type = "empty-widget"}.style.horizontally_stretchable = true
+    modes.add{type = "button", name = "resbal_chain_open", caption = {"resbal.chain-open"},
+              tooltip = {"resbal.chain-open-tooltip"}}
 
     local panel = state.panels[state.focus]
     local current = state.tracker and state.tracker.panel
@@ -1117,46 +1169,50 @@ return function(ctx)
     content.style.maximal_height = 600
     content.style.minimal_width = 760
     content.style.top_margin = 6
-    local tools = content.add{type = "flow", direction = "horizontal"}
-    tools.add{type = "empty-widget"}.style.horizontally_stretchable = true
-    tools.add{type = "button", name = "resbal_chain_open", caption = {"resbal.chain-open"},
-              tooltip = {"resbal.chain-open-tooltip"}}
-    content.add{type = "label", name = "resbal_flow_header", caption = "", style = "bold_label"}
-    local target = content.add{type = "label", name = "resbal_flow_target", caption = "",
-                               tooltip = {"resbal.target-verdict-tooltip"}}
-    target.style.single_line = false
-    target.style.maximal_width = 740
+    -- картка діагнозу (редизайн 1.7): числа, історія станів смужками, 0–3 рядки причин за однією схемою
+    -- (значок стану + речення + кнопки дій); службовий рядок «оцінка… · стан машин N с тому» — у підказці
+    local card = content.add{type = "frame", name = "resbal_flow_card", direction = "vertical", style = "bordered_frame"}
+    card.style.horizontally_stretchable = true
+    local head = card.add{type = "flow", name = "resbal_card_head", direction = "horizontal"}
+    head.style.vertical_align = "center"
+    local title = head.add{type = "label", name = "resbal_card_title", caption = "", style = "bold_label"}
+    title.style.font_color = {0.85, 0.85, 0.85}
+    head.add{type = "empty-widget"}.style.horizontally_stretchable = true
+    local info = head.add{type = "sprite", name = "resbal_flow_status", sprite = "utility/tip_icon"}
+    info.style.size = 16
+    info.style.stretch_image_to_widget_size = true
+    card.add{type = "label", name = "resbal_flow_header", caption = ""}
+    local history = card.add{type = "flow", name = "resbal_flow_history", direction = "horizontal",
+                             tooltip = {"resbal.history-tooltip"}}
+    history.style.vertical_align = "center"
+    history.style.horizontal_spacing = 8
+    local target = card.add{type = "label", name = "resbal_flow_target", caption = "", style = "resbal_cause_label",
+                            tooltip = {"resbal.target-verdict-tooltip"}}
     target.visible = false
-    local status = content.add{type = "label", name = "resbal_flow_status", caption = ""}
-    status.style.font_color = {0.7, 0.7, 0.7}
-    local history = content.add{type = "label", name = "resbal_flow_history", caption = "",
-                                tooltip = {"resbal.history-tooltip"}}
-    history.style.single_line = false
-    history.style.maximal_width = 740
-    local cause = content.add{type = "flow", name = "resbal_flow_cause", direction = "horizontal"}
+    local cause = card.add{type = "flow", name = "resbal_flow_cause", direction = "horizontal"}
     cause.style.vertical_align = "center"
     cause.style.horizontal_spacing = 4
     cause.style.top_margin = 4
     cause.visible = false
     -- «буфер повний»: виробники чекають, споживачі працюють із запасу — не дефіцит
-    local buffer = content.add{type = "label", name = "resbal_flow_buffer", caption = {"resbal.buffer"},
+    local buffer = card.add{type = "label", name = "resbal_flow_buffer", style = "resbal_cause_label",
+                               caption = {"", "[img=" .. STATUS_SPRITES.full_output .. "] ", {"resbal.buffer"}},
                                tooltip = {"resbal.buffer-tooltip"}}
-    buffer.style.single_line = false
-    buffer.style.maximal_width = 740
-    buffer.style.font_color = {0.6, 0.8, 1}
     buffer.style.top_margin = 4
     buffer.visible = false
     -- «перевір доставку» / «забитий побічний продукт»: текст + кнопки (хто споживає, показати машину)
-    local delivery = content.add{type = "flow", name = "resbal_flow_delivery", direction = "vertical"}
+    local delivery = card.add{type = "flow", name = "resbal_flow_delivery", direction = "vertical"}
     delivery.style.top_margin = 4
     delivery.style.vertical_spacing = 2
     delivery.visible = false
-    local delivery_text = delivery.add{type = "label", name = "resbal_delivery_text", caption = ""}
-    delivery_text.style.single_line = false
-    delivery_text.style.maximal_width = 740
-    delivery_text.style.font_color = {1, 0.85, 0.3}
+    -- текст звичайного кольору; значок стану (синій — вихід повний) уже на початку підпису
+    delivery.add{type = "label", name = "resbal_delivery_text", caption = "", style = "resbal_cause_label"}
     local delivery_buttons = delivery.add{type = "flow", name = "resbal_delivery_buttons", direction = "horizontal"}
     delivery_buttons.style.horizontal_spacing = 4
+    -- дефіцит є, а жодної причини не знайдено — так і кажемо (замість порожнечі)
+    local none = card.add{type = "label", name = "resbal_flow_none", caption = {"resbal.card-no-cause"},
+                          style = "resbal_quiet_label"}
+    none.visible = false
     flow_section(content, "resbal_flow_producers", {"resbal.producers"})
     flow_section(content, "resbal_flow_consumers", {"resbal.consumers"})
     update_flow_tab(player)
@@ -1306,6 +1362,21 @@ return function(ctx)
     return {root = root, surface = panel.surface, precision = PRECISIONS[precision_index]}
   end
 
+  -- Сканування машин для ресурсу у фокусі (спільне для «Виробників і споживачів» і «Першопричин»):
+  -- новий трекер, лише якщо ресурс змінився; сам прохід іде порціями в on_tick
+  local function ensure_tracker(player, state)
+    state.focus = math.max(1, math.min(state.focus or 1, #state.panels))
+    local panel = state.panels[state.focus]
+    local current = state.tracker and state.tracker.panel
+    if not (current and current.type == panel.type and current.name == panel.name and current.surface == panel.surface) then
+      state.tracker = new_tracker(panel)
+      state.cursors = {}
+      start_rescan(state.tracker, player)
+    end
+    return state.tracker
+  end
+
   return {step_rescan = step_rescan, update_flow_tab = update_flow_tab, show_next_machine = show_next_machine,
-          build_flow_tab = build_flow_tab, chain_candidates = chain_candidates, root_causes = root_causes}
+          build_flow_tab = build_flow_tab, chain_candidates = chain_candidates, root_causes = root_causes,
+          ensure_tracker = ensure_tracker}
 end
